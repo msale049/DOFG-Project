@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+.venv-DMS/
+venv/
+env/
+
+# Data and outputs
+Data/
+results/
+output/
+occlusion_samples/
+
+# Model weights (large; add locally)
+resnet34_portable.state_dict.pt
+resnet34_occlusion.pt
+shape_predictor_68_face_landmarks.dat
+*.pth
+
+# Cache
+*.cache
+*_cache_*.pt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+train.log

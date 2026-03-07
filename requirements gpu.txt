@@ -1,0 +1,35 @@
+# Install torch FIRST (before other packages) — ONNXRuntime needs torch imported first for CUDA
+# For H100/A100: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# For older GPUs: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+# Computer Vision (older version for Anvil compatibility)
+opencv-python-headless==4.8.1.78
+numpy==1.26.4
+
+# Data Processing and Analysis
+pandas==2.2.3
+scikit-learn==1.5.2
+
+# Visualization
+matplotlib==3.9.3
+seaborn==0.13.2
+
+# Face Detection and Landmarks
+dlib>=19.24.0
+insightface==0.7.3
+# Use onnxruntime (CPU) to leave GPU for PyTorch; or onnxruntime-gpu if torch imported first
+onnxruntime==1.19.2
+
+# Feature Extraction and Statistical Analysis
+scikit-image==0.24.0
+scipy==1.13.1
+
+# Jupyter kernel
+ipykernel>=6.29.0
+
+# insightface dependencies
+prettytable
+easydict
+
+# Protobuf (pinned for onnxruntime compatibility)
+protobuf>=3.20,<5
