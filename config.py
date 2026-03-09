@@ -31,9 +31,10 @@ def seed_everything(seed: int = SEED) -> None:
 CONFIG = {
     # ── Paths ──────────────────────────────────────────────────────────────
     'CSV_DATASET_PATH': 'Data',
-    'RESNET34_MODEL_PATH': 'resnet34_portable.state_dict.pt',
-    'RESNET34_OCCLUSION_MODEL_PATH': 'resnet34_occlusion.pt',
-    'DLIB_MODEL_PATH': 'shape_predictor_68_face_landmarks.dat',
+    'RESNET34_MODEL_PATH': 'models/resnet34_portable.state_dict.pt',
+    'RESNET34_OCCLUSION_MODEL_PATH': 'models/resnet34_occlusion.pt',
+    'DLIB_MODEL_PATH': 'models/shape_predictor_68_face_landmarks.dat',
+    'MMOD_MODEL_PATH': 'models/mmod_human_face_detector.dat',
 
     # ── Image processing ────────────────────────────────────────────────────
     'IMG_SIZE': (224, 224),

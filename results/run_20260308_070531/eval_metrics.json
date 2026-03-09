@@ -1,0 +1,8 @@
+{
+  "accuracy": 93.54838709677419,
+  "n_samples": 1488,
+  "source": "stress_test_clean_condition",
+  "val_clean_accuracy": 97.88541666666667,
+  "val_stress_clean_acc": 97.625,
+  "val_stress_mean_delta": -0.13888888888888437
+}

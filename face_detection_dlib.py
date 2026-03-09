@@ -21,6 +21,7 @@ import cv2
 import dlib
 import numpy as np
 
+from config import CONFIG
 from utils import bbox_from_points, approx_yaw_from_landmarks, rect_to_tuple
 
 
@@ -49,11 +50,13 @@ class FaceDetector:
 
     def __init__(self,
                  shape_model_path: str,
-                 cnn_model_path: str = 'mmod_human_face_detector.dat',
+                 cnn_model_path: str = None,
                  hog_upsample: int = 0,
                  cnn_upsample: int = 0,
                  use_pose_filter: bool = False,
                  yaw_thresh_deg: float = 15.0):
+        if cnn_model_path is None:
+            cnn_model_path = CONFIG.get('MMOD_MODEL_PATH', 'models/mmod_human_face_detector.dat')
         self.hog = dlib.get_frontal_face_detector()
         self.cnn = dlib.cnn_face_detection_model_v1(cnn_model_path)
         self.predictor = dlib.shape_predictor(shape_model_path)

@@ -16,15 +16,14 @@ python run_train_eval.py --strategy clip --epochs 20 --benchmark
 ## Required Files (not in repo — add locally)
 
 - `Data/` — DMD dataset (Sub1..Sub15 with video + CSV)
-- `resnet34_portable.state_dict.pt` — Feature extractor weights
-- `resnet34_occlusion.pt` — Occlusion estimator weights  
-- `shape_predictor_68_face_landmarks.dat` — dlib landmarks
+- `models/resnet34_portable.state_dict.pt` — Feature extractor weights
+- `models/resnet34_occlusion.pt` — Occlusion estimator weights
+- `models/shape_predictor_68_face_landmarks.dat` — dlib landmarks
 
 ## Dependencies
 
 ```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-pip install -r "requirements gpu.txt"
+uv pip install -r requirements-gpu.txt
 ```
 
 See `docs/ANVIL_GPU_DEPLOYMENT.md` for full setup and troubleshooting.

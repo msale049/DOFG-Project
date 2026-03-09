@@ -22,44 +22,7 @@ import torchvision.transforms as T
 from PIL import Image
 from insightface.app import FaceAnalysis
 
-
-# ─── Configuration ────────────────────────────────────────────────────────────
-
-CONFIG = {
-    'CSV_DATASET_PATH': 'Data',
-    'RESNET34_MODEL_PATH': 'resnet34_portable.state_dict.pt',
-    'RESNET34_OCCLUSION_MODEL_PATH': 'resnet34_occlusion.pt',
-    'DLIB_MODEL_PATH': 'shape_predictor_68_face_landmarks.dat',
-
-    'IMG_SIZE': (224, 224),
-    'TARGET_FACE_SIZE': (224, 224),
-    'IMAGENET_MEAN': [0.485, 0.456, 0.406],
-    'IMAGENET_STD': [0.229, 0.224, 0.225],
-
-    'EAR_THRESHOLD': 0.25,
-    'MAR_THRESHOLD': 0.65,
-    'MIN_FACE_CONFIDENCE': 0.5,
-    'BATCH': 32,
-
-    'CSV_LABELS': {'EyeClosed': 0, 'Yawn': 1, 'Neutral': 2},
-    'NUM_CLASSES': 3,
-}
-
-
-# ─── Data Structures ─────────────────────────────────────────────────────────
-
-@dataclass
-class CSVAnnotation:
-    frame: int
-    timestamp: float
-    class_label: str
-    variant: str
-    eyes_state: str
-    yawn_with_hand: bool
-    yawn_without_hand: bool
-    eyes_occluded_prior: bool
-    mouth_occluded_prior: bool
-    glasses: bool
+from config import CONFIG, CSVAnnotation
 
 
 # ─── Data Loading ─────────────────────────────────────────────────────────────
@@ -327,7 +290,7 @@ class ResNet34OcclusionModel:
         self.model.fc = nn.Linear(self.model.fc.in_features, 2)
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-        self.model.load_state_dict(torch.load(ckpt_path, map_location=self.device))
+        self.model.load_state_dict(torch.load(ckpt_path, map_location=self.device, weights_only=True))
         self.model.to(self.device).eval()
         self.tf = _eval_transform()
 

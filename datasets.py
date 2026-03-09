@@ -188,10 +188,9 @@ class DriverStateDataset(Dataset):
         occlusion_info = dict(sample['occlusion_info'])
 
         label = torch.tensor(sample['label'], dtype=torch.long)
-        occ_targets = torch.tensor([
-            occlusion_info['eye_occlusion_prob'],
-            occlusion_info['mouth_occlusion_prob'],
-        ], dtype=torch.float32)
+        eye_occ = sample.get('gt_eye_occ', occlusion_info['eye_occlusion_prob'])
+        mouth_occ = sample.get('gt_mouth_occ', occlusion_info['mouth_occlusion_prob'])
+        occ_targets = torch.tensor([eye_occ, mouth_occ], dtype=torch.float32)
 
         return {
             'features':          features_dict,

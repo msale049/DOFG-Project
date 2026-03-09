@@ -11,17 +11,19 @@ env/
 
 # Data and outputs
 Data/
-results/
+data/
+models/
 output/
 occlusion_samples/
 
-# Model weights (large; add locally)
+# Model weights (large)
 resnet34_portable.state_dict.pt
 resnet34_occlusion.pt
 shape_predictor_68_face_landmarks.dat
 *.pth
 exp_aplus_enhanced_best.pt
 dmd_*_cache_*.pt
+results/**/model_best.pt
 
 # Cache
 *.cache

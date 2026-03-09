@@ -71,10 +71,10 @@ Data/
 
 ### 5. Dependencies
 
-Use `requirements gpu.txt` on Anvil (assumes PyTorch with CUDA already installed):
+Use `requirements-gpu.txt` (includes PyTorch with CUDA):
 
 ```bash
-pip install -r "requirements gpu.txt"
+uv pip install -r requirements-gpu.txt
 ```
 
 ---

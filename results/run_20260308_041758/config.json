@@ -1,0 +1,19 @@
+{
+  "data": "Data",
+  "samples_per_video": "all",
+  "epochs": 10,
+  "batch_size": 16,
+  "mode": "fixed",
+  "k": 5,
+  "num_test": 3,
+  "fold": 0,
+  "face_detector": "retina",
+  "det_size": 640,
+  "face_cpu": false,
+  "seed": 42,
+  "stress_test": true,
+  "stress_frames": 20,
+  "defer_test": true,
+  "strategy": "clip",
+  "class_weighted": true
+}

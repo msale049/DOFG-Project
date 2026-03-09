@@ -1,0 +1,30 @@
+{
+  "face_detection_ms": {
+    "mean_ms": 14.369198852218688,
+    "std_ms": 1.3750040940256822,
+    "median_ms": 14.029614045284688
+  },
+  "feature_extraction_ms": {
+    "mean_ms": 22.91502622421831,
+    "std_ms": 0.26014211483743405,
+    "median_ms": 22.799028549343348
+  },
+  "occlusion_estimator_ms": {
+    "mean_ms": 6.524357451125979,
+    "std_ms": 0.09033553747923895,
+    "median_ms": 6.492943037301302
+  },
+  "transformer_inference_ms": {
+    "mean_ms": 3.0580943264067173,
+    "std_ms": 0.06109267388675924,
+    "median_ms": 3.043425502255559
+  },
+  "total_per_frame_ms": {
+    "mean_ms": 46.86667685396969,
+    "std_ms": 1.4919648634074478,
+    "median_ms": 46.66769679170102
+  },
+  "num_warmup": 20,
+  "num_iter": 50,
+  "device": "cuda"
+}

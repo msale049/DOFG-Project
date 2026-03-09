@@ -7,7 +7,7 @@ the DOFG-DMS journal experiments.
 Architecture highlights
 -----------------------
 - 4 region-wise feature projectors (face, left_eye, right_eye, mouth)
-- MLP occlusion gates (eye_gate, mouth_gate) mapping P(occ) → gate ∈ [0.3, 1.0]
+- MLP occlusion gates (eye_gate, mouth_gate) mapping P(occ) → gate ∈ [0.05, 1.0]
 - Sinusoidal positional encodings + region-type embeddings
 - 2-layer Transformer encoder with pre-norm
 - Learnable query-token cross-attention pooling
@@ -217,7 +217,7 @@ class EnhancedOcclusionAwareTransformer(nn.Module):
 
         type_ids = torch.tensor(region_types, device=device)
         type_emb = self.region_type_embedding(type_ids).unsqueeze(0).expand(batch_size, -1, -1)
-        token_sequence = token_sequence + pos_emb + type_emb
+        tokens = token_sequence + pos_emb + type_emb
 
         # ── Gating ─────────────────────────────────────────────────────────
         if disable_gating:
@@ -230,15 +230,13 @@ class EnhancedOcclusionAwareTransformer(nn.Module):
             eye_g   = self.occlusion_gates['eye_gate'](eye_occ.unsqueeze(1)).squeeze(1)
             mouth_g = self.occlusion_gates['mouth_gate'](mouth_occ.unsqueeze(1)).squeeze(1)
             face_gates        = torch.ones(batch_size, device=device)
-            left_eye_gates    = 0.3 + 0.7 * eye_g
-            right_eye_gates   = 0.3 + 0.7 * eye_g
-            mouth_gates_final = 0.3 + 0.7 * mouth_g
+            left_eye_gates    = 0.05 + 0.95 * eye_g
+            right_eye_gates   = 0.05 + 0.95 * eye_g
+            mouth_gates_final = 0.05 + 0.95 * mouth_g
 
-        gated = token_sequence.clone()
-        gated[:, 0, :] *= face_gates.unsqueeze(1)
-        gated[:, 1, :] *= left_eye_gates.unsqueeze(1)
-        gated[:, 2, :] *= right_eye_gates.unsqueeze(1)
-        gated[:, 3, :] *= mouth_gates_final.unsqueeze(1)
+        gate_mask = torch.stack([face_gates, left_eye_gates,
+                                  right_eye_gates, mouth_gates_final], dim=1)  # [B, 4]
+        gated = tokens * gate_mask.unsqueeze(2)  # [B, 4, H]
 
         hidden_states = self.transformer_encoder(gated)   # [B, 4, H]
 

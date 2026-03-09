@@ -32,16 +32,22 @@ from ablation_utils import disable_gates_at_inference
 from data_loading import sample_frames_for_audit
 from synthetic_occlusion import apply_eye_band, apply_mouth_rect
 
-# STRATEGY_DESIGN E.2: 6 conditions — clean + 5 stress (opacity 0.8)
-# Transient uses middle T/4 of clip
-STRESS_CONDITIONS_STRATEGY = [
-    ('clean', 'clean', 0.0),
-    ('persistent_eye', 'persistent_eye', 0.8),
-    ('persistent_mouth', 'persistent_mouth', 0.8),
-    ('persistent_both', 'persistent_both', 0.8),
-    ('transient_eye', 'transient_eye', 0.8),
-    ('transient_mouth', 'transient_mouth', 0.8),
+STRESS_REGIMES = [
+    'persistent_eye',
+    'persistent_mouth',
+    'persistent_both',
+    'transient_eye',
+    'transient_mouth',
 ]
+
+
+def _build_stress_conditions(opacities):
+    """Build (name, regime, opacity) triples: clean + each regime x each opacity."""
+    conditions = [('clean', 'clean', 0.0)]
+    for opacity in sorted(opacities):
+        for regime in STRESS_REGIMES:
+            conditions.append((f'{regime}@{opacity}', regime, opacity))
+    return conditions
 
 # Occlusion configs: (name, eye_flag, mouth_flag) — which region gets the opacity (legacy)
 OCCLUSION_CONFIGS = [
@@ -247,8 +253,11 @@ def run_stress_test_detailed(
                         row['t_trans_ms'] = round(t_trans, 3)
                         row['t_total_ms'] = round(t_det + t_feat + t_occ + t_trans, 3)
                     rows.append(row)
+                    del fdict, occ_info, out_on, out_off
 
             processed += 1
+            if processed % 100 == 0 and use_cuda:
+                torch.cuda.empty_cache()
             if processed % 25 == 0:
                 elapsed = time.time() - t0
                 rate = processed / elapsed if elapsed > 0 else 0
@@ -302,15 +311,20 @@ def run_stress_test_clips(
     seed: int = 42,
     label_map: Optional[Dict[str, int]] = None,
     include_timing: bool = True,
+    stress_opacities: Optional[List[float]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Clip-based stress test with 6 STRATEGY_DESIGN conditions.
+    Clip-based stress test with multi-opacity support.
 
-    Each test clip is evaluated in: clean + persistent_eye/mouth/both + transient_eye/mouth (opacity 0.8).
+    Each test clip is evaluated in: clean + each regime x each opacity.
     Returns (details_df, summary_df) with p_eye, p_mouth, gates, predictions per frame/condition.
     """
     if label_map is None:
         label_map = {'EyeClosed': 0, 'Yawn': 1, 'Neutral': 2}
+    if stress_opacities is None:
+        stress_opacities = [0.4, 0.6, 0.8, 1.0]
+
+    conditions = _build_stress_conditions(stress_opacities)
 
     if not test_clips:
         return pd.DataFrame(), pd.DataFrame()
@@ -319,6 +333,7 @@ def run_stress_test_clips(
     processed, skipped = 0, 0
     t0 = time.time()
     use_cuda = (device == 'cuda')
+    n_conditions = len(conditions)
 
     for clip in test_clips:
         meta = csv_data.get(clip.video_key)
@@ -329,7 +344,6 @@ def run_stress_test_clips(
             continue
 
         ann_by_frame = {a.frame: a for a in meta['annotations']}
-        # Subsample frames for speed
         frame_indices = list(range(len(clip.frame_numbers)))
         if max_frames_per_clip and len(frame_indices) > max_frames_per_clip:
             step = len(frame_indices) / max_frames_per_clip
@@ -362,7 +376,7 @@ def run_stress_test_clips(
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             gt = label_map[ann.class_label]
 
-            for cond_name, regime, opacity in STRESS_CONDITIONS_STRATEGY:
+            for cond_name, regime, opacity in conditions:
                 aug_rgb = _apply_stress_condition(
                     rgb, lm, regime, opacity, fi, clip.T,
                 )
@@ -384,7 +398,6 @@ def run_stress_test_clips(
                 }
                 probs = occ_model.predict_probs(
                     aug_rgb, face_bbox=fb, image_bgr=False, face_margin=0.15)
-                t_occ = 0.0
                 occ_info = {
                     'eye_occlusion_prob': torch.tensor([float(probs[0])], device=device, dtype=torch.float32),
                     'mouth_occlusion_prob': torch.tensor([float(probs[1])], device=device, dtype=torch.float32),
@@ -409,6 +422,7 @@ def run_stress_test_clips(
                     'class_label': ann.class_label,
                     'gt_label': gt,
                     'condition': cond_name,
+                    'regime': regime,
                     'opacity': opacity,
                     'p_eye': float(probs[0]),
                     'p_mouth': float(probs[1]),
@@ -425,8 +439,11 @@ def run_stress_test_clips(
                     row['t_feat_ms'] = round(t_feat, 3)
                     row['t_trans_ms'] = round(t_trans, 3)
                 rows.append(row)
+                del fdict, occ_info, out_on, out_off
 
             processed += 1
+            if processed % 100 == 0 and use_cuda:
+                torch.cuda.empty_cache()
 
         cap.release()
 
@@ -434,13 +451,13 @@ def run_stress_test_clips(
     if len(details) == 0:
         return details, pd.DataFrame()
 
-    # Summary: accuracy by condition
     summary_rows = []
-    for cond_name, _, opacity in STRESS_CONDITIONS_STRATEGY:
+    for cond_name, regime, opacity in conditions:
         sub = details[details['condition'] == cond_name]
         if len(sub) > 0:
             summary_rows.append({
                 'condition': cond_name,
+                'regime': regime,
                 'opacity': opacity,
                 'acc_gating_on': sub['correct_gating_on'].mean() * 100,
                 'acc_gating_off': sub['correct_gating_off'].mean() * 100,
@@ -448,7 +465,8 @@ def run_stress_test_clips(
                 'n': len(sub),
             })
     summary = pd.DataFrame(summary_rows)
-    print(f'  Stress-test (clips): {processed} frames, {len(details)} rows, {time.time()-t0:.0f}s')
+    print(f'  Stress-test (clips): {processed} frames, {len(details)} rows, '
+          f'{n_conditions} conditions, {time.time()-t0:.0f}s')
     return details, summary
 
 
@@ -634,6 +652,7 @@ def run_stress_test(
             max_frames_per_clip=max_frames_per_clip,
             seed=seed,
             include_timing=True,
+            stress_opacities=opacity_levels,
         )
     details = run_stress_test_detailed(
         csv_data, test_keys, model, face_detector, feat_extractor, occ_model,

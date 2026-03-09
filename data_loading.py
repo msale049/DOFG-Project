@@ -57,9 +57,16 @@ def load_csv_video_data(dataset_path: str,
 
         for video_file in video_files:
             video_name = os.path.splitext(video_file)[0]
-            csv_file   = f'{video_name}.csv'
+            csv_file = f'{video_name}.csv'
             if csv_file not in csv_files:
-                continue
+                # Try alternate naming: Sub11_video.mp4 -> Sub11_csv.csv
+                alt_csv = video_name.rsplit('_', 1)[0] + '_csv.csv' if '_' in video_name else None
+                if alt_csv and alt_csv in csv_files:
+                    csv_file = alt_csv
+                elif len(csv_files) == 1:
+                    csv_file = csv_files[0]
+                else:
+                    continue
 
             video_path = os.path.join(subject_path, video_file)
             csv_path   = os.path.join(subject_path, csv_file)

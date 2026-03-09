@@ -31,7 +31,9 @@ from sklearn.model_selection import train_test_split
 from config import CSVAnnotation, CLIP_CONFIG, SEED
 from clip_sampler import ClipInfo, extract_clips_for_videos
 from split_generator import get_train_val_test_clips
-from occlusion_augmentation import assign_regime_to_clip, apply_occlusion_to_frame
+from occlusion_augmentation import (
+    assign_regime_to_clip, apply_occlusion_to_frame, is_frame_in_transient_segment,
+)
 
 
 # ─── Phase-based pipeline (used with process_sample_frames approach) ──────────
@@ -471,7 +473,7 @@ def extract_features_for_clips(
     max_val_clips: Optional[int] = None,
     max_test_clips: Optional[int] = None,
     skip_test: bool = False,
-) -> Tuple[List[Dict], List[Dict], List[Dict], List]:
+) -> Tuple[List[Dict], List[Dict], List[Dict], List, List]:
     """
     Extract features from clips with regime-based occlusion (STRATEGY_DESIGN.md).
 
@@ -485,7 +487,7 @@ def extract_features_for_clips(
 
     Returns
     -------
-    (train_samples, val_samples, test_samples, test_clips) — frame-level samples + test clips for stress test
+    (train_samples, val_samples, test_samples, test_clips, val_clips)
     """
     if label_map is None:
         label_map = {'EyeClosed': 0, 'Yawn': 1, 'Neutral': 2}
@@ -525,18 +527,33 @@ def extract_features_for_clips(
     train_samples: List[Dict] = []
     val_samples: List[Dict] = []
     test_samples: List[Dict] = []
+    rkeys = ['face_features', 'left_eye_features', 'right_eye_features', 'mouth_features']
 
     def _annotations_by_frame(meta):
         return {a.frame: a for a in meta['annotations']}
 
-    for clip in train_clips:
-        meta = csv_data[clip.video_key]
-        cap = cv2.VideoCapture(meta['video_path'])
-        if not cap.isOpened():
-            continue
-        regime, opacity = assign_regime_to_clip(clip, seed=seed)
-        clip_seed = hash((clip.video_key, clip.clip_start, seed)) % (2**32)
-        ann_by_frame = _annotations_by_frame(meta)
+    def _gt_occ_for_frame(regime, opacity, frame_idx, clip_len, clip_seed):
+        """Compute ground-truth eye/mouth occlusion for a frame given the applied regime."""
+        if regime == 'clean' or opacity <= 0:
+            return 0.0, 0.0
+        is_active = True
+        if regime.startswith('transient'):
+            is_active = is_frame_in_transient_segment(
+                frame_idx, clip_len, seg_len=clip_len // 4, clip_seed=clip_seed)
+        if not is_active:
+            return 0.0, 0.0
+        eye_occ = opacity if regime in ('persistent_eye', 'transient_eye', 'persistent_both') else 0.0
+        mouth_occ = opacity if regime in ('persistent_mouth', 'transient_mouth', 'persistent_both') else 0.0
+        return eye_occ, mouth_occ
+
+    def _process_clip(clip, cap, ann_by_frame, augment: bool, samples_out: List[Dict]):
+        """Process one clip's frames and append to samples_out."""
+        regime, opacity = ('clean', 0.0)
+        clip_seed = 0
+        if augment:
+            regime, opacity = assign_regime_to_clip(clip, seed=seed)
+            clip_seed = hash((clip.video_key, clip.clip_start, seed)) % (2**32)
+
         ok = 0
         for fi, frame_num in enumerate(clip.frame_numbers):
             ann = ann_by_frame.get(frame_num)
@@ -550,22 +567,20 @@ def extract_features_for_clips(
             if not det['is_valid']:
                 continue
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            if regime != 'clean' and opacity > 0 and det.get('landmarks') is not None:
-                aug_img = apply_occlusion_to_frame(
+            if augment and regime != 'clean' and opacity > 0 and det.get('landmarks') is not None:
+                rgb = apply_occlusion_to_frame(
                     rgb, det['landmarks'], regime, opacity,
-                    frame_idx_in_clip=fi, clip_len=clip.T, clip_seed=clip_seed,
-                )
-                bgr = cv2.cvtColor(aug_img, cv2.COLOR_RGB2BGR)
-                rgb = aug_img
+                    frame_idx_in_clip=fi, clip_len=clip.T, clip_seed=clip_seed)
+                bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
             feat = feat_extractor.extract_region_features(
                 bgr, det['face_bbox'], det['eye_regions'], det['mouth_region'])
-            rkeys = ['face_features', 'left_eye_features', 'right_eye_features', 'mouth_features']
             if any(feat[k] is None for k in rkeys):
                 continue
             probs = occ_model.predict_probs(
                 rgb, face_bbox=det['face_bbox'], image_bgr=False, face_margin=0.15)
-            sample = {
-                'frame_id': len(train_samples) + ok,
+            gt_eye, gt_mouth = _gt_occ_for_frame(regime, opacity, fi, clip.T, clip_seed)
+            samples_out.append({
+                'frame_id': len(samples_out) + ok,
                 'subject': clip.subject,
                 'video_key': clip.video_key,
                 'features': {
@@ -578,6 +593,8 @@ def extract_features_for_clips(
                     'eye_occlusion_prob': float(probs[0]),
                     'mouth_occlusion_prob': float(probs[1]),
                 },
+                'gt_eye_occ': gt_eye,
+                'gt_mouth_occ': gt_mouth,
                 'label': label_map[ann.class_label],
                 'class_name': ann.class_label,
                 'ground_truth': {
@@ -585,119 +602,38 @@ def extract_features_for_clips(
                     'mouth_occluded': ann.mouth_occluded_prior,
                     'eyes_state': ann.eyes_state,
                 },
-            }
-            train_samples.append(sample)
+            })
+            del bgr, rgb, feat, det
             ok += 1
-        cap.release()
-        if ok > 0:
-            print(f'  {clip.video_key} clip@{clip.clip_start}: {ok} frames (regime={regime})')
+        return ok, regime
 
-    for clip in val_clips:
-        meta = csv_data[clip.video_key]
-        cap = cv2.VideoCapture(meta['video_path'])
-        if not cap.isOpened():
-            continue
-        ann_by_frame = _annotations_by_frame(meta)
-        ok = 0
-        for fi, frame_num in enumerate(clip.frame_numbers):
-            ann = ann_by_frame.get(frame_num)
-            if ann is None or ann.class_label not in label_map:
-                continue
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-            ret, bgr = cap.read()
-            if not ret:
-                continue
-            det = face_detector.detect_face_and_landmarks(bgr)
-            if not det['is_valid']:
-                continue
-            feat = feat_extractor.extract_region_features(
-                bgr, det['face_bbox'], det['eye_regions'], det['mouth_region'])
-            rkeys = ['face_features', 'left_eye_features', 'right_eye_features', 'mouth_features']
-            if any(feat[k] is None for k in rkeys):
-                continue
-            probs = occ_model.predict_probs(
-                cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), face_bbox=det['face_bbox'],
-                image_bgr=False, face_margin=0.15)
-            sample = {
-                'frame_id': len(val_samples) + ok,
-                'subject': clip.subject,
-                'video_key': clip.video_key,
-                'features': {
-                    'face': feat['face_features'],
-                    'left_eye': feat['left_eye_features'],
-                    'right_eye': feat['right_eye_features'],
-                    'mouth': feat['mouth_features'],
-                },
-                'occlusion_info': {
-                    'eye_occlusion_prob': float(probs[0]),
-                    'mouth_occlusion_prob': float(probs[1]),
-                },
-                'label': label_map[ann.class_label],
-                'class_name': ann.class_label,
-                'ground_truth': {
-                    'eyes_occluded': ann.eyes_occluded_prior,
-                    'mouth_occluded': ann.mouth_occluded_prior,
-                    'eyes_state': ann.eyes_state,
-                },
-            }
-            val_samples.append(sample)
-            ok += 1
-        cap.release()
+    def _process_clips_grouped(clips, augment: bool, samples_out: List[Dict], split_label: str):
+        """Group clips by video_key, open each video once."""
+        from collections import defaultdict
+        by_video = defaultdict(list)
+        for clip in clips:
+            by_video[clip.video_key].append(clip)
 
-    if not skip_test:
-        for clip in test_clips:
-            meta = csv_data[clip.video_key]
+        for video_key, vclips in by_video.items():
+            meta = csv_data.get(video_key)
+            if not meta:
+                continue
             cap = cv2.VideoCapture(meta['video_path'])
             if not cap.isOpened():
                 continue
             ann_by_frame = _annotations_by_frame(meta)
-            ok = 0
-            for fi, frame_num in enumerate(clip.frame_numbers):
-                ann = ann_by_frame.get(frame_num)
-                if ann is None or ann.class_label not in label_map:
-                    continue
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-                ret, bgr = cap.read()
-                if not ret:
-                    continue
-                det = face_detector.detect_face_and_landmarks(bgr)
-                if not det['is_valid']:
-                    continue
-                feat = feat_extractor.extract_region_features(
-                    bgr, det['face_bbox'], det['eye_regions'], det['mouth_region'])
-                rkeys = ['face_features', 'left_eye_features', 'right_eye_features', 'mouth_features']
-                if any(feat[k] is None for k in rkeys):
-                    continue
-                probs = occ_model.predict_probs(
-                    cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), face_bbox=det['face_bbox'],
-                    image_bgr=False, face_margin=0.15)
-                sample = {
-                    'frame_id': len(test_samples) + ok,
-                    'subject': clip.subject,
-                    'video_key': clip.video_key,
-                    'features': {
-                        'face': feat['face_features'],
-                        'left_eye': feat['left_eye_features'],
-                        'right_eye': feat['right_eye_features'],
-                        'mouth': feat['mouth_features'],
-                    },
-                    'occlusion_info': {
-                        'eye_occlusion_prob': float(probs[0]),
-                        'mouth_occlusion_prob': float(probs[1]),
-                    },
-                    'label': label_map[ann.class_label],
-                    'class_name': ann.class_label,
-                    'ground_truth': {
-                        'eyes_occluded': ann.eyes_occluded_prior,
-                        'mouth_occluded': ann.mouth_occluded_prior,
-                        'eyes_state': ann.eyes_state,
-                    },
-                }
-                test_samples.append(sample)
-                ok += 1
+            for clip in vclips:
+                ok, regime = _process_clip(clip, cap, ann_by_frame, augment, samples_out)
+                if ok > 0:
+                    extra = f' (regime={regime})' if augment else ''
+                    print(f'  {video_key} clip@{clip.clip_start}: {ok} frames [{split_label}]{extra}')
             cap.release()
-            if ok > 0:
-                print(f'  {clip.video_key} clip@{clip.clip_start}: {ok} frames [TEST]')
+
+    _process_clips_grouped(train_clips, augment=True, samples_out=train_samples, split_label='TRAIN')
+    _process_clips_grouped(val_clips, augment=False, samples_out=val_samples, split_label='VAL')
+
+    if not skip_test:
+        _process_clips_grouped(test_clips, augment=False, samples_out=test_samples, split_label='TEST')
     else:
         print('  [Skipped test extraction — will load during stress test]')
 
@@ -708,4 +644,4 @@ def extract_features_for_clips(
                 dist[s['class_name']] = dist.get(s['class_name'], 0) + 1
             print(f'  {name}: {len(ss)} samples  {dist}')
 
-    return train_samples, val_samples, test_samples, test_clips
+    return train_samples, val_samples, test_samples, test_clips, val_clips

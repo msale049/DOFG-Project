@@ -1,0 +1,8 @@
+{
+  "stage1_data_loading": 2.94,
+  "stage2_feature_extraction": 4566.24,
+  "stage3_training": 204.35,
+  "stage4_stress_test": 631.93,
+  "stage5_evaluation": 13.09,
+  "total_elapsed": 5418.97
+}

@@ -1,0 +1,12 @@
+{
+  "n_train": 9600,
+  "n_eval": 9600,
+  "eval_set": "val",
+  "overall_accuracy": 97.88541666666667,
+  "acc_EyeClosed": 99.25611052072264,
+  "n_EyeClosed": 1882,
+  "acc_Yawn": 87.63250883392226,
+  "n_Yawn": 1132,
+  "acc_Neutral": 99.25599757060432,
+  "n_Neutral": 6586
+}

@@ -1,0 +1,39 @@
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+# PyTorch (CUDA 12.4 for H100/A100)
+torch
+torchvision
+
+# Build dependency for dlib
+cmake
+
+# Computer Vision (headless — no libGL needed on HPC)
+opencv-python-headless==4.8.1.78
+numpy==1.26.4
+
+# Data Processing and Analysis
+pandas==2.2.3
+scikit-learn==1.5.2
+
+# Visualization
+matplotlib==3.9.3
+seaborn==0.13.2
+
+# Face Detection and Landmarks
+dlib>=19.24.0
+insightface==0.7.3
+onnxruntime-gpu
+
+# Feature Extraction and Statistical Analysis
+scikit-image==0.24.0
+scipy==1.13.1
+
+# Jupyter kernel
+ipykernel>=6.29.0
+
+# insightface dependencies
+prettytable
+easydict
+
+# Protobuf (pinned for onnxruntime compatibility)
+protobuf>=3.20,<5
