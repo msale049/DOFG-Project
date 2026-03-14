@@ -30,7 +30,7 @@ from synthetic_occlusion import (
     apply_mouth_rect,
     OPACITY_LEVELS,
 )
-from occlusion_augmentation import apply_occlusion_to_frame
+from occlusion_augmentation import apply_occlusion_to_frame, get_transient_segment
 
 
 def generate_occlusion_grid_png(
@@ -97,15 +97,18 @@ def generate_occlusion_grid_png(
     seg_len = max(4, T // 4)
     seg_start = (T - seg_len) // 2
 
+    actual_seg_start, actual_seg_end = get_transient_segment(T, clip_seed)
+    actual_seg_mid = (actual_seg_start + actual_seg_end) // 2
+
     def _apply_regime(regime, opacity, use_middle_seg=False):
         if regime == 'clean' or opacity <= 0:
             return rgb.copy()
         if regime.startswith('transient') and use_middle_seg:
-            in_seg = seg_start <= (T // 2) < seg_start + seg_len
-            if not in_seg:
-                return rgb.copy()
-            return apply_eye_band(rgb, lm, opacity=opacity) if 'eye' in regime else apply_mouth_rect(rgb, lm, opacity=opacity)
-        return apply_occlusion_to_frame(rgb, lm, regime, opacity, T // 2, T, clip_seed)
+            if 'eye' in regime:
+                return apply_eye_band(rgb, lm, opacity=opacity)
+            return apply_mouth_rect(rgb, lm, opacity=opacity)
+        fi = actual_seg_mid if regime.startswith('transient') else T // 2
+        return apply_occlusion_to_frame(rgb, lm, regime, opacity, fi, T, clip_seed)
 
     # Build grid: 5 rows x 3 cols
     # Row 1-2: Training regimes (6)
@@ -221,8 +224,14 @@ def main():
         ('transient_eye', 0.8),
         ('transient_mouth', 0.8),
     ]
+    seg_start, seg_end = get_transient_segment(T, clip_seed)
+    seg_mid = (seg_start + seg_end) // 2
     for regime, opacity in regimes:
-        for fi, frame_idx in enumerate([0, T // 2]):  # first frame, middle frame
+        if regime.startswith('transient'):
+            frame_indices = [0, seg_mid]
+        else:
+            frame_indices = [0, T // 2]
+        for fi, frame_idx in enumerate(frame_indices):
             aug = apply_occlusion_to_frame(rgb, lm, regime, opacity, frame_idx, T, clip_seed)
             out_bgr = cv2.cvtColor(aug, cv2.COLOR_RGB2BGR)
             fname = f'train_{regime}_op{opacity}_fi{frame_idx}.jpg'

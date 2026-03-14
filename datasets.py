@@ -149,9 +149,11 @@ class DriverStateDataset(Dataset):
 
     CLASS_NAMES = ['EyeClosed', 'Yawn', 'Neutral']
 
-    def __init__(self, training_samples: List[Dict], device: str = 'cpu'):
+    def __init__(self, training_samples: List[Dict], device: str = 'cpu',
+                 gate_supervision: str = 'gt'):
         self.samples    = training_samples
         self.device     = device
+        self.gate_supervision = gate_supervision
 
         print(f'DriverStateDataset initialized')
         print(f'  Samples : {len(training_samples)}')
@@ -188,8 +190,12 @@ class DriverStateDataset(Dataset):
         occlusion_info = dict(sample['occlusion_info'])
 
         label = torch.tensor(sample['label'], dtype=torch.long)
-        eye_occ = sample.get('gt_eye_occ', occlusion_info['eye_occlusion_prob'])
-        mouth_occ = sample.get('gt_mouth_occ', occlusion_info['mouth_occlusion_prob'])
+        if self.gate_supervision == 'estimator':
+            eye_occ = occlusion_info['eye_occlusion_prob']
+            mouth_occ = occlusion_info['mouth_occlusion_prob']
+        else:
+            eye_occ = sample.get('gt_eye_occ', occlusion_info['eye_occlusion_prob'])
+            mouth_occ = sample.get('gt_mouth_occ', occlusion_info['mouth_occlusion_prob'])
         occ_targets = torch.tensor([eye_occ, mouth_occ], dtype=torch.float32)
 
         return {

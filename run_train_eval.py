@@ -703,6 +703,18 @@ def main():
     ap.add_argument('--face-cpu', action='store_true')
     ap.add_argument('--class-weighted', action='store_true',
                     help='Use class-weighted cross-entropy loss')
+    ap.add_argument('--gate-supervision', choices=['gt', 'estimator'], default='gt',
+                    help='Gate alignment target: gt=ground-truth, estimator=proxy')
+    ap.add_argument('--gate-weight', type=float, default=0.5,
+                    help='Weight for gate alignment loss (w_gate_occ)')
+    ap.add_argument('--gate-floor', type=float, default=0.05,
+                    help='Minimum gate value (0.0-1.0)')
+    ap.add_argument('--diversity-reg', type=float, default=0.0,
+                    help='Gate diversity regularisation weight (0=off)')
+    ap.add_argument('--clip-length', type=int, default=32,
+                    help='Frames per clip (T)')
+    ap.add_argument('--natural-occlusion-eval', action='store_true',
+                    help='Run evaluation on natural-occlusion subset')
     args = ap.parse_args()
 
     if args.face_cpu:
@@ -719,6 +731,12 @@ def main():
               f'({torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB)')
     print(f'Mode: {args.mode}, samples/video: {args.samples or "ALL"}, epochs: {args.epochs}')
 
+    # Override CLIP_CONFIG['T'] if --clip-length differs from default
+    if args.clip_length != 32:
+        from config import CLIP_CONFIG
+        CLIP_CONFIG['T'] = args.clip_length
+        print(f'  Clip length overridden: T={args.clip_length}')
+
     config_dict = {
         'data': args.data, 'samples_per_video': args.samples or 'all',
         'epochs': args.epochs, 'batch_size': args.batch, 'mode': args.mode,
@@ -728,6 +746,12 @@ def main():
         'stress_test': args.stress, 'stress_frames': args.stress_frames,
         'defer_test': args.defer_test, 'strategy': args.strategy,
         'class_weighted': args.class_weighted,
+        'gate_supervision': args.gate_supervision,
+        'gate_weight': args.gate_weight,
+        'gate_floor': args.gate_floor,
+        'diversity_reg': args.diversity_reg,
+        'clip_length': args.clip_length,
+        'natural_occlusion_eval': args.natural_occlusion_eval,
         'validation_protocol': 'dual (clean primary + stress secondary)',
     }
     with open(os.path.join(run_dir, 'config.json'), 'w') as f:
@@ -798,11 +822,14 @@ def main():
     # ── Stage 3: Training ─────────────────────────────────────────────────────
     t0 = time.time()
     print('\n=== Stage 3: Training ===')
-    train_ds = DriverStateDataset(train_samples, device=str(device))
-    val_ds = DriverStateDataset(val_samples, device=str(device))
+    train_ds = DriverStateDataset(train_samples, device=str(device),
+                                   gate_supervision=args.gate_supervision)
+    val_ds = DriverStateDataset(val_samples, device=str(device),
+                                gate_supervision=args.gate_supervision)
     test_loader = None
     if test_samples:
-        test_ds = DriverStateDataset(test_samples, device=str(device))
+        test_ds = DriverStateDataset(test_samples, device=str(device),
+                                     gate_supervision=args.gate_supervision)
         test_loader = DataLoader(test_ds, batch_size=args.batch, shuffle=False,
                                  collate_fn=test_ds.collate_samples)
 
@@ -814,6 +841,7 @@ def main():
     model = EnhancedOcclusionAwareTransformer(
         feature_dim=512, hidden_dim=128, num_heads=4,
         num_classes=3, num_layers=3, use_relative_pos=True,
+        gate_floor=args.gate_floor,
     ).to(device)
     print(f'Model params: {sum(p.numel() for p in model.parameters()):,}')
 
@@ -827,7 +855,10 @@ def main():
         print(f'  Class weights: {[f"{w:.2f}" for w in weights]}')
 
     trainer = TinyTransformerTrainer(model, device=str(device), learning_rate=3e-5,
-                                    class_weights=class_weights)
+                                    class_weights=class_weights,
+                                    gate_weight=args.gate_weight,
+                                    gate_floor=args.gate_floor,
+                                    diversity_reg=args.diversity_reg)
 
     best_val_acc = 0.0
     for epoch in range(args.epochs):
@@ -986,6 +1017,41 @@ def main():
     _save_comprehensive_analysis(
         model, val_loader, test_loader, val_samples, test_samples,
         history, stress_summary, stress_details, run_dir, device)
+
+    # Natural occlusion evaluation (DMD annotations: eyes_occluded, mouth_occluded)
+    if args.natural_occlusion_eval and test_samples:
+        print('\n--- Natural Occlusion Evaluation ---')
+        nat_occ_samples = [
+            s for s in test_samples
+            if s.get('ground_truth', {}).get('eyes_occluded')
+            or s.get('ground_truth', {}).get('mouth_occluded')
+        ]
+        if nat_occ_samples:
+            nat_ds = DriverStateDataset(nat_occ_samples, device=str(device),
+                                        gate_supervision=args.gate_supervision)
+            nat_loader = DataLoader(nat_ds, batch_size=args.batch, shuffle=False,
+                                    collate_fn=nat_ds.collate_samples)
+            nat_metrics = compute_metrics_on_loader(trainer, nat_loader, compute_loss=False)
+            nat_result = {
+                'accuracy': nat_metrics.get('accuracy', 0),
+                'n_samples': len(nat_occ_samples),
+                'n_eyes_occluded': sum(
+                    1 for s in nat_occ_samples
+                    if s.get('ground_truth', {}).get('eyes_occluded')),
+                'n_mouth_occluded': sum(
+                    1 for s in nat_occ_samples
+                    if s.get('ground_truth', {}).get('mouth_occluded')),
+            }
+            with open(os.path.join(run_dir, 'natural_occlusion_eval.json'), 'w') as f:
+                json.dump(nat_result, f, indent=2)
+            print(f'  Natural occ samples: {nat_result["n_samples"]} '
+                  f'(eyes={nat_result["n_eyes_occluded"]}, '
+                  f'mouth={nat_result["n_mouth_occluded"]})')
+            print(f'  Natural occ accuracy: {nat_result["accuracy"]:.1f}%')
+            eval_dict['natural_occ_accuracy'] = nat_result['accuracy']
+            eval_dict['natural_occ_n'] = nat_result['n_samples']
+        else:
+            print('  No natural occlusion samples found in test set.')
 
     # Occlusion visualization
     if face_detector is not None:

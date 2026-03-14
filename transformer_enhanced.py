@@ -43,7 +43,8 @@ class EnhancedOcclusionAwareTransformer(nn.Module):
 
     def __init__(self, feature_dim: int = 512, hidden_dim: int = 128,
                  num_heads: int = 4, num_classes: int = 3,
-                 num_layers: int = 2, use_relative_pos: bool = True):
+                 num_layers: int = 2, use_relative_pos: bool = True,
+                 gate_floor: float = 0.05):
         super().__init__()
         self.feature_dim = feature_dim
         self.hidden_dim  = hidden_dim
@@ -52,6 +53,7 @@ class EnhancedOcclusionAwareTransformer(nn.Module):
         self.num_regions = 4
         self.num_layers  = num_layers
         self.use_relative_pos = use_relative_pos
+        self.gate_floor  = gate_floor
 
         # ── Feature projectors ────────────────────────────────────────────────
         self.feature_projectors = nn.ModuleDict({
@@ -229,10 +231,11 @@ class EnhancedOcclusionAwareTransformer(nn.Module):
             eye_occ, mouth_occ = self._extract_occ_probs(occlusion_info, batch_size, device)
             eye_g   = self.occlusion_gates['eye_gate'](eye_occ.unsqueeze(1)).squeeze(1)
             mouth_g = self.occlusion_gates['mouth_gate'](mouth_occ.unsqueeze(1)).squeeze(1)
+            f = self.gate_floor
             face_gates        = torch.ones(batch_size, device=device)
-            left_eye_gates    = 0.05 + 0.95 * eye_g
-            right_eye_gates   = 0.05 + 0.95 * eye_g
-            mouth_gates_final = 0.05 + 0.95 * mouth_g
+            left_eye_gates    = f + (1.0 - f) * eye_g
+            right_eye_gates   = f + (1.0 - f) * eye_g
+            mouth_gates_final = f + (1.0 - f) * mouth_g
 
         gate_mask = torch.stack([face_gates, left_eye_gates,
                                   right_eye_gates, mouth_gates_final], dim=1)  # [B, 4]

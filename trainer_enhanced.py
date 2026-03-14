@@ -2,22 +2,23 @@
 trainer_enhanced.py
 ===================
 TinyTransformerTrainer — trainer for EnhancedOcclusionAwareTransformer with
-the full three-term loss:
+a configurable loss:
 
-    L = L_class  +  0.1 * L_gate_align  −  0.01 * L_gate_div
+    L = L_class  +  gate_weight * L_gate_align  +  diversity_reg * L_gate_div
 
 where
   L_class      is cross-entropy over the 3 driver states.
   L_gate_align teaches eye/mouth gate MLPs to output low values when
-               the occlusion estimator reports high occlusion probability
-               (gate target = 0.3 + 0.7 * (1 − p_occ)).
+               occlusion is high (gate target = floor + (1-floor) * (1 − p_occ)).
   L_gate_div   is negative gate variance, encouraging diverse gate outputs
-               across the four regions.
+               across the four regions (off by default, diversity_reg=0).
 
 Usage
 -----
     from trainer_enhanced import TinyTransformerTrainer
-    trainer = TinyTransformerTrainer(model, device='cuda')
+    trainer = TinyTransformerTrainer(model, device='cuda',
+                                    gate_weight=0.5, gate_floor=0.05,
+                                    diversity_reg=0.0)
     trainer.train_epoch(train_loader, epoch=0)
     trainer.evaluate(val_loader)
 """
@@ -46,7 +47,10 @@ class TinyTransformerTrainer:
 
     def __init__(self, model, device: str = 'cpu',
                  learning_rate: float = 3e-5,
-                 class_weights: torch.Tensor = None):
+                 class_weights: torch.Tensor = None,
+                 gate_weight: float = 0.5,
+                 gate_floor: float = 0.05,
+                 diversity_reg: float = 0.0):
         self.model  = model.to(device)
         self.device = device
 
@@ -62,10 +66,11 @@ class TinyTransformerTrainer:
 
         self.loss_weights = {
             'classification': 1.0,
-            'gate_occ':       0.5,
+            'gate_occ':       gate_weight,
         }
 
-        self.gate_floor = 0.05
+        self.gate_floor = gate_floor
+        self.diversity_reg = diversity_reg
 
         self.history: Dict = {
             'epoch_losses':          [],
@@ -112,10 +117,17 @@ class TinyTransformerTrainer:
         total_loss = (self.loss_weights['classification'] * class_loss
                       + self.loss_weights['gate_occ'] * gate_occ_reg)
 
+        gate_div_loss = torch.tensor(0.0, device=self.device)
+        if self.diversity_reg > 0 and gf is not None:
+            gate_var = gf.var(dim=0).mean()
+            gate_div_loss = -gate_var
+            total_loss += self.diversity_reg * gate_div_loss
+
         return {
             'total_loss':          total_loss,
             'classification_loss': class_loss,
             'gate_occ_reg':        gate_occ_reg,
+            'gate_div_loss':       gate_div_loss,
             'gate_factors':        gf.detach(),
         }
 
