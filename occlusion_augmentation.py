@@ -5,7 +5,8 @@ Clip-consistent and transient synthetic occlusion for training.
 Extends synthetic_occlusion.py with regime assignment and temporal consistency.
 """
 
-from typing import Dict, List, Optional, Tuple
+import hashlib
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 
@@ -37,10 +38,66 @@ def _sample_opacity(opacity_band: str, rng: np.random.Generator) -> float:
     return float(rng.uniform(b[0], b[1]))
 
 
+def stable_seed_from_parts(*parts) -> int:
+    """Return a process-stable 32-bit seed derived from arbitrary values."""
+    payload = '||'.join(str(p) for p in parts).encode('utf-8')
+    digest = hashlib.blake2b(payload, digest_size=8).digest()
+    return int.from_bytes(digest[:4], byteorder='little', signed=False)
+
+
+def _sample_train_opacity(
+    rng: np.random.Generator,
+    opacity_sampler: Optional[Dict] = None,
+) -> float:
+    """
+    Sample train-time occlusion opacity.
+
+    Supported modes
+    ---------------
+    legacy:
+        Preserve the original V4 behavior: 50% hard (=1.0), 50% medium~U(0.7, 0.9)
+    discrete:
+        Sample from a fixed list of opacity values, optionally with weights
+    uniform:
+        Sample continuously from [low, high]
+    """
+    mode = (opacity_sampler or {}).get('mode', 'legacy')
+
+    if mode == 'legacy':
+        opacity_band = 'hard' if rng.random() < 0.5 else 'medium'
+        return _sample_opacity(opacity_band, rng)
+
+    if mode == 'discrete':
+        values = [float(v) for v in (opacity_sampler or {}).get('values', [])]
+        if not values:
+            raise ValueError("opacity_sampler mode='discrete' requires non-empty 'values'")
+        weights = (opacity_sampler or {}).get('weights')
+        if weights is not None:
+            weights = np.asarray(weights, dtype=float)
+            if len(weights) != len(values):
+                raise ValueError('train opacity weights must match the number of values')
+            if np.any(weights < 0):
+                raise ValueError('train opacity weights must be non-negative')
+            if float(weights.sum()) <= 0:
+                raise ValueError('train opacity weights must sum to a positive value')
+            weights = weights / weights.sum()
+        return float(rng.choice(np.asarray(values, dtype=float), p=weights))
+
+    if mode == 'uniform':
+        low = float((opacity_sampler or {}).get('low', 0.0))
+        high = float((opacity_sampler or {}).get('high', 1.0))
+        if not (0.0 <= low <= high <= 1.0):
+            raise ValueError('uniform train opacity range must satisfy 0 <= low <= high <= 1')
+        return float(rng.uniform(low, high))
+
+    raise ValueError(f'Unknown train opacity sampling mode: {mode!r}')
+
+
 def assign_regime_to_clip(
     clip_info,
     regime_weights: Optional[Dict[str, float]] = None,
     class_caps: Optional[Dict[str, float]] = None,
+    opacity_sampler: Optional[Dict] = None,
     seed: int = SEED,
 ) -> Tuple[str, float]:
     """
@@ -70,7 +127,7 @@ def assign_regime_to_clip(
         class_caps = AUGMENTATION_CONFIG.get('CLASS_CAPS', {})
 
     rng = np.random.default_rng(seed)
-    h = hash((clip_info.video_key, clip_info.clip_start, clip_info.T, seed)) % (2**32)
+    h = stable_seed_from_parts(clip_info.video_key, clip_info.clip_start, clip_info.T, seed)
     rng = np.random.default_rng(int(h))
 
     regimes = list(regime_weights.keys())
@@ -101,8 +158,7 @@ def assign_regime_to_clip(
             regime = 'clean'
             return 'clean', 0.0
 
-    opacity_band = 'hard' if rng.random() < 0.5 else 'medium'
-    opacity = _sample_opacity(opacity_band, rng)
+    opacity = _sample_train_opacity(rng, opacity_sampler=opacity_sampler)
     return regime, opacity
 
 
@@ -140,7 +196,7 @@ def is_frame_in_transient_segment(
     clip_len : T
     seg_len : length of transient segment (default T//4)
     seg_start : start index (if None, computed from clip_seed)
-    clip_seed : for deterministic segment boundaries (e.g. hash(video_key, clip_start))
+    clip_seed : stable per-clip seed for deterministic segment boundaries
 
     Returns
     -------
@@ -178,7 +234,7 @@ def apply_occlusion_to_frame(
     opacity : float in [0, 1]
     frame_idx_in_clip : 0..clip_len-1
     clip_len : T
-    clip_seed : hash(video_key, clip_start, seed) for deterministic transient segment
+    clip_seed : stable per-clip seed for deterministic transient segment placement
 
     Returns
     -------

@@ -74,7 +74,8 @@ def disable_gates_at_inference(model: nn.Module):
     ...     df_no_gate = collect_eval_with_occlusion(my_model, test_loader)
     """
     if not hasattr(model, 'occlusion_gates'):
-        raise AttributeError("Model has no attribute 'occlusion_gates'.")
+        yield
+        return
 
     gates = model.occlusion_gates
     try:
@@ -85,13 +86,24 @@ def disable_gates_at_inference(model: nn.Module):
             "Could not access 'eye_gate'/'mouth_gate' in model.occlusion_gates"
         ) from e
 
+    # Legacy mechanism: force the gate MLPs to output 1.0. Covers old
+    # checkpoints that rely on multiplicative token gating.
     gates['eye_gate']   = _OnesGate()
     gates['mouth_gate'] = _OnesGate()
+
+    # New mechanism (transformer_enhanced.py V2): signal the model to skip
+    # attention-bias gating *and* the gate-conditioned logit bias head.
+    # Without this, setting gates to 1.0 still leaves log(1)=0 attention bias
+    # (harmless) but the logit bias head would still be evaluated at (1,1)
+    # which produces a constant per-class shift that biases predictions.
+    prev_flag = getattr(model, '_force_gating_disabled', False)
     try:
+        model._force_gating_disabled = True
         yield
     finally:
         gates['eye_gate']   = eye_orig
         gates['mouth_gate'] = mouth_orig
+        model._force_gating_disabled = prev_flag
 
 
 @contextmanager

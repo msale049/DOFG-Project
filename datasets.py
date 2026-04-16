@@ -185,7 +185,12 @@ class DriverStateDataset(Dataset):
             region: (torch.tensor(arr, dtype=torch.float32)
                      if not isinstance(arr, torch.Tensor) else arr.float())
             for region, arr in sample['features'].items()
+            if region != 'face_crop'
         }
+
+        if 'face_crop' in sample.get('features', {}):
+            from resnet_baseline import face_crop_to_tensor
+            features_dict['face_crop'] = face_crop_to_tensor(sample['features']['face_crop'])
 
         occlusion_info = dict(sample['occlusion_info'])
 

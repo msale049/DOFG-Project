@@ -66,18 +66,24 @@ class FaceDetector:
 
         print('Initializing RetinaFace detector...')
         force_cpu = os.environ.get('DOFG_FACE_CPU', '0') in ('1', 'true', 'yes')
-        if torch.cuda.is_available() and not force_cpu:
+        if force_cpu:
+            providers = ['CPUExecutionProvider']
+            ctx_id = -1
+        elif torch.cuda.is_available():
             available = onnxruntime.get_available_providers()
             if 'CUDAExecutionProvider' in available:
                 providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
                 ctx_id = 0
             else:
-                print('  WARNING: CUDAExecutionProvider not available, falling back to CPU')
-                providers = ['CPUExecutionProvider']
-                ctx_id = -1
+                raise RuntimeError(
+                    'RetinaFace requires ONNX Runtime CUDAExecutionProvider, '
+                    'but it is not available. CPU fallback is disabled.'
+                )
         else:
-            providers = ['CPUExecutionProvider']
-            ctx_id = -1
+            raise RuntimeError(
+                'RetinaFace requires CUDA, but torch.cuda.is_available() is False. '
+                'CPU fallback is disabled.'
+            )
 
         stderr_fd = os.dup(2)
         devnull = os.open(os.devnull, os.O_WRONLY)

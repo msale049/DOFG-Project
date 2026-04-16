@@ -36,6 +36,10 @@ try:
 except ImportError:
     _HAS_SKLEARN = False
 
+from metrics_utils import (
+    compute_classification_metrics,
+    compute_classification_uncertainty,
+)
 from utils import move_batch_to_device
 
 
@@ -49,7 +53,10 @@ def compute_metrics_on_loader(trainer, loader,
 
     Returns
     -------
-    dict with keys: loss, accuracy, precision, recall, f1, preds, labels.
+    dict with keys:
+        loss, accuracy, balanced_accuracy, precision, recall, f1,
+        macro_precision, macro_recall, macro_f1, uncertainty,
+        per_class, confusion_matrix, preds, labels.
     """
     model     = trainer.model
     device    = trainer.device
@@ -75,22 +82,24 @@ def compute_metrics_on_loader(trainer, loader,
                 total_loss += float(loss.item()) * labels.shape[0]
                 n += labels.shape[0]
 
-    if _HAS_SKLEARN:
-        acc = accuracy_score(all_labels, all_preds) * 100 if all_labels else 0.0
-        prec, rec, f1, _ = precision_recall_fscore_support(
-            all_labels, all_preds, average='weighted', zero_division=0)
-    else:
-        acc  = float(np.mean(np.array(all_preds) == np.array(all_labels)) * 100)
-        prec = rec = f1 = float('nan')
-
     val_loss = (total_loss / max(n, 1)) if compute_loss else None
+    metrics = compute_classification_metrics(
+        all_labels, all_preds, label_names=['EyeClosed', 'Yawn', 'Neutral'])
+    uncertainty = compute_classification_uncertainty(all_labels, all_preds)
 
     return {
         'loss':      val_loss,
-        'accuracy':  acc,
-        'precision': float(prec),
-        'recall':    float(rec),
-        'f1':        float(f1),
+        'accuracy':  metrics.get('accuracy', 0.0),
+        'balanced_accuracy': metrics.get('balanced_accuracy', float('nan')),
+        'precision': metrics.get('precision', float('nan')),
+        'recall':    metrics.get('recall', float('nan')),
+        'f1':        metrics.get('f1', float('nan')),
+        'macro_precision': metrics.get('macro_precision', float('nan')),
+        'macro_recall': metrics.get('macro_recall', float('nan')),
+        'macro_f1': metrics.get('macro_f1', float('nan')),
+        'per_class': metrics.get('per_class', {}),
+        'confusion_matrix': metrics.get('confusion_matrix', []),
+        'uncertainty': uncertainty,
         'preds':     all_preds,
         'labels':    all_labels,
     }

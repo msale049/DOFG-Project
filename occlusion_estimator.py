@@ -35,9 +35,9 @@ class ResNet34OcclusionModel:
 
     def __init__(self, ckpt_path: str, device: Optional[str] = None):
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        weights_enum = getattr(M, 'ResNet34_Weights', None)
-        weights = weights_enum.IMAGENET1K_V1 if weights_enum else None
-        self.model = M.resnet34(weights=weights)
+        # Use weights=None because the checkpoint already contains the trained
+        # backbone and the cluster environment may not allow network downloads.
+        self.model = M.resnet34(weights=None)
         self.model.fc = nn.Linear(self.model.fc.in_features, 2)
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(f'Checkpoint not found: {ckpt_path}')
