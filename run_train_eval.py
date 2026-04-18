@@ -30,9 +30,11 @@ import argparse
 import gc
 import json
 import os
+import random
 import sys
 import time
 from datetime import datetime
+from typing import Dict
 
 os.environ.setdefault('OMP_NUM_THREADS', '1')
 os.environ.setdefault('OMP_WAIT_POLICY', 'PASSIVE')
@@ -40,6 +42,7 @@ os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
 os.environ.setdefault('MKL_NUM_THREADS', '1')
 os.environ.setdefault('ORT_LOG_LEVEL', '3')  # suppress ONNX Runtime thread affinity warnings
 os.environ.setdefault('ONNXRUNTIME_SESSION_THREAD_POOL_SIZE', '1')
+os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
 
 import numpy as np
 import pandas as pd
@@ -53,13 +56,48 @@ from split_generator import create_splits, get_subject_ids
 from pipeline import extract_features_stratified, extract_features_for_clips
 from datasets import DriverStateDataset
 from transformer_enhanced import EnhancedOcclusionAwareTransformer
+from mlp_baseline import RegionFeatureMLP
+from resnet_baseline import ResNet34Baseline
 from trainer_enhanced import TinyTransformerTrainer
 from evaluation import compute_metrics_on_loader, collect_eval_with_occlusion
+from metrics_utils import (
+    compute_classification_metrics,
+    compute_classification_uncertainty,
+    compute_paired_binary_statistics,
+)
 from stress_test import run_stress_test
-from visualize_occlusion import generate_occlusion_grid_png
+from visualize_occlusion import (
+    generate_occlusion_grid_png,
+    generate_clean_vs_synthetic_opacity_grid,
+)
 
 
 # ─── GPU memory helpers ──────────────────────────────────────────────────────
+
+def _gpu_memory_snapshot() -> str:
+    """Return a compact snapshot of CUDA allocator state."""
+    if not torch.cuda.is_available():
+        return 'cuda unavailable'
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        allocated = torch.cuda.memory_allocated()
+        reserved = torch.cuda.memory_reserved()
+        return (
+            f'free={free_bytes / 1e9:.2f} GB / total={total_bytes / 1e9:.2f} GB | '
+            f'allocated={allocated / 1e6:.0f} MB | reserved={reserved / 1e6:.0f} MB'
+        )
+    except Exception as e:
+        return f'cuda snapshot unavailable ({e})'
+
+
+def _require_cuda(context: str) -> None:
+    """Fail fast instead of silently falling back to CPU."""
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            f'CUDA is required for {context}, but torch.cuda.is_available() is False. '
+            'This run would otherwise fall back to CPU.'
+        )
+
 
 def _gpu_cleanup(msg: str = ''):
     """Force garbage collection and clear CUDA cache."""
@@ -67,8 +105,7 @@ def _gpu_cleanup(msg: str = ''):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     if msg:
-        allocated = torch.cuda.memory_allocated() / 1e6 if torch.cuda.is_available() else 0
-        print(f'  [GPU cleanup] {msg} — {allocated:.0f} MB allocated')
+        print(f'  [GPU cleanup] {msg} — {_gpu_memory_snapshot()}')
 
 
 def _delete_models(*models):
@@ -77,6 +114,94 @@ def _delete_models(*models):
         if m is not None:
             del m
     _gpu_cleanup('models freed')
+
+
+def _set_global_seed(seed: int):
+    """Seed Python, NumPy, and PyTorch for reproducible training runs."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception:
+        pass
+    if hasattr(torch.backends, 'cudnn'):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    print(f'Global seed set to {seed} (deterministic mode enabled)')
+
+
+def _seed_worker(worker_id: int):
+    """Seed DataLoader workers from PyTorch's per-worker initial seed."""
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def _parse_float_list(spec: str | None) -> list[float]:
+    """Parse a comma-separated float list."""
+    if not spec:
+        return []
+    values = []
+    for token in spec.split(','):
+        token = token.strip()
+        if not token:
+            continue
+        values.append(float(token))
+    return values
+
+
+def _build_train_opacity_sampler(args) -> Dict:
+    """
+    Build the train-time opacity sampling config.
+
+    Precedence:
+      1. --train-opacity-values => discrete
+      2. --train-opacity-range  => uniform
+      3. otherwise              => selected mode (default legacy)
+    """
+    values = _parse_float_list(args.train_opacity_values)
+    weights = _parse_float_list(args.train_opacity_weights)
+    range_vals = _parse_float_list(args.train_opacity_range)
+
+    for v in values:
+        if not (0.0 < v <= 1.0):
+            raise ValueError(f'train opacity values must lie in (0, 1]; got {v}')
+    for v in range_vals:
+        if not (0.0 <= v <= 1.0):
+            raise ValueError(f'train opacity range values must lie in [0, 1]; got {v}')
+
+    if weights:
+        if not values:
+            raise ValueError('--train-opacity-weights requires --train-opacity-values')
+        if len(weights) != len(values):
+            raise ValueError('--train-opacity-weights must match --train-opacity-values length')
+        if any(w < 0 for w in weights) or sum(weights) <= 0:
+            raise ValueError('--train-opacity-weights must be non-negative and sum to a positive value')
+
+    if values:
+        return {
+            'mode': 'discrete',
+            'values': values,
+            'weights': weights or None,
+        }
+
+    if range_vals:
+        if len(range_vals) != 2:
+            raise ValueError('--train-opacity-range must be exactly "LOW,HIGH"')
+        low, high = range_vals
+        if low > high:
+            raise ValueError('--train-opacity-range requires LOW <= HIGH')
+        return {
+            'mode': 'uniform',
+            'low': low,
+            'high': high,
+        }
+
+    return {'mode': args.train_opacity_mode}
 
 
 # ─── Split / results helpers ─────────────────────────────────────────────────
@@ -101,11 +226,11 @@ def _splits_from_fixed_or_fold(csv_data, mode='fixed', k=5, num_test=5, seed=SEE
     }
 
 
-def _ensure_results_dir() -> str:
-    """Create results/run_YYYYMMDD_HHMMSS and return path."""
-    os.makedirs('results', exist_ok=True)
+def _ensure_results_dir(results_root: str = 'results', run_name: str | None = None) -> str:
+    """Create results/run_YYYYMMDD_HHMMSS (or custom name) and return path."""
+    os.makedirs(results_root, exist_ok=True)
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    run_dir = os.path.join('results', f'run_{stamp}')
+    run_dir = os.path.join(results_root, run_name or f'run_{stamp}')
     os.makedirs(run_dir, exist_ok=True)
     return run_dir
 
@@ -144,28 +269,35 @@ def _import_plt():
 
 
 def _save_training_curves(history: dict, run_dir: str):
-    """Plot and save training loss and accuracy curves."""
+    """Train vs Val: loss and accuracy on same axes."""
     plt, _ = _import_plt()
     if plt is None:
         return
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
     epochs = np.arange(1, len(history.get('epoch_losses', [])) + 1)
+    has_val = bool(history.get('val_epoch_losses'))
     if epochs.size > 0:
-        ax1.plot(epochs, history.get('epoch_losses', []), 'o-')
-        ax1.set(xlabel='Epoch', ylabel='Loss', title='Training Loss')
+        ax1.plot(epochs, history['epoch_losses'], 'o-', lw=2, color='#2196F3', label='Train')
+        if has_val:
+            ax1.plot(epochs, history['val_epoch_losses'], 's--', lw=2, color='#FF5722', label='Val')
+        ax1.set(xlabel='Epoch', ylabel='Total Loss', title='Train vs Val — Total Loss')
+        ax1.legend()
         ax1.grid(True)
-        ax2.plot(epochs, history.get('accuracies', []), 's-', label='Train')
-        ax2.set(xlabel='Epoch', ylabel='Accuracy (%)', title='Training Accuracy')
+
+        ax2.plot(epochs, history['accuracies'], 'o-', lw=2, color='#2196F3', label='Train')
+        if has_val:
+            ax2.plot(epochs, history['val_accuracies'], 's--', lw=2, color='#FF5722', label='Val')
+        ax2.set(xlabel='Epoch', ylabel='Accuracy (%)', title='Train vs Val — Accuracy')
         ax2.legend()
         ax2.grid(True)
-    fig.suptitle('Training Curves', fontweight='bold')
+    fig.suptitle('Training Curves', fontweight='bold', fontsize=14)
     plt.tight_layout()
     plt.savefig(os.path.join(run_dir, 'training_curves.png'), bbox_inches='tight', dpi=150)
     plt.close(fig)
 
 
 def _save_training_dynamics(history: dict, run_dir: str):
-    """Plot loss components and gate statistics across epochs."""
+    """Train-only loss components, accuracy, and gate statistics."""
     plt, _ = _import_plt()
     if plt is None:
         return
@@ -175,29 +307,27 @@ def _save_training_dynamics(history: dict, run_dir: str):
 
     has_gates = bool(history.get('mean_eye_gate'))
     n_rows = 3 if has_gates else 2
-    fig, axes = plt.subplots(n_rows, 1, figsize=(10, 4 * n_rows), sharex=True)
+    fig, axes = plt.subplots(n_rows, 1, figsize=(12, 4.5 * n_rows), sharex=True)
 
-    axes[0].plot(epochs, history.get('epoch_losses', []), 'o-', lw=2, label='Total Loss')
-    if 'classification_losses' in history:
-        axes[0].plot(epochs, history['classification_losses'], 's--', lw=1.5, label='Classification')
-    if 'gate_occ_losses' in history:
-        axes[0].plot(epochs, history['gate_occ_losses'], '^--', lw=1.5, label='Gate Alignment')
+    axes[0].plot(epochs, history['epoch_losses'], 'o-', lw=2, color='#2196F3', label='Total Loss')
+    axes[0].plot(epochs, history['classification_losses'], 's--', lw=1.5, color='#4CAF50', label='Classification Loss')
+    axes[0].plot(epochs, history['gate_occ_losses'], '^--', lw=1.5, color='#9C27B0', label='Gate Alignment Loss')
     axes[0].set(ylabel='Loss', title='Training Dynamics — Loss Components')
-    axes[0].legend()
+    axes[0].legend(fontsize=9)
     axes[0].grid(True)
 
-    if 'accuracies' in history:
-        axes[1].plot(epochs, history['accuracies'], 'D-', lw=2, color='green')
-        axes[1].set(ylabel='Accuracy (%)', title='Training Accuracy')
-        axes[1].grid(True)
+    axes[1].plot(epochs, history['accuracies'], 'o-', lw=2, color='#4CAF50')
+    axes[1].set(ylabel='Accuracy (%)', title='Training Dynamics — Accuracy')
+    axes[1].grid(True)
 
     if has_gates:
-        axes[2].plot(epochs, history['mean_eye_gate'], 'o-', lw=2, label='Mean Eye Gate')
-        axes[2].plot(epochs, history['mean_mouth_gate'], 's-', lw=2, label='Mean Mouth Gate')
+        axes[2].plot(epochs, history['mean_eye_gate'], 'o-', lw=2, color='#2196F3', label='Mean Eye Gate')
+        axes[2].plot(epochs, history['mean_mouth_gate'], 's-', lw=2, color='#4CAF50', label='Mean Mouth Gate')
         axes[2].axhline(y=1.0, color='gray', ls=':', lw=1, label='Max (clean target)')
         axes[2].axhline(y=0.05, color='red', ls=':', lw=1, label='Floor (0.05)')
-        axes[2].set(xlabel='Epoch', ylabel='Gate Value', title='Gate Statistics Across Training')
-        axes[2].legend()
+        axes[2].set(xlabel='Epoch', ylabel='Gate Value',
+                    title='Gate Statistics Across Training')
+        axes[2].legend(fontsize=9)
         axes[2].grid(True)
     else:
         axes[-1].set_xlabel('Epoch')
@@ -205,6 +335,97 @@ def _save_training_dynamics(history: dict, run_dir: str):
     plt.tight_layout()
     plt.savefig(os.path.join(run_dir, 'training_dynamics.png'), bbox_inches='tight', dpi=150)
     plt.close(fig)
+
+
+def _save_val_loss_components(history: dict, run_dir: str):
+    """Separate plot: validation loss components (classification + gate)."""
+    plt, _ = _import_plt()
+    if plt is None or not history.get('val_classification_losses'):
+        return
+    epochs = np.arange(1, len(history['val_classification_losses']) + 1)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(epochs, history['val_epoch_losses'], 'o-', lw=2, color='#FF5722', label='Val Total Loss')
+    ax.plot(epochs, history['val_classification_losses'], 's--', lw=2, color='#FF9800', label='Val Classification Loss')
+    ax.plot(epochs, history['val_gate_occ_losses'], '^--', lw=2, color='#E91E63', label='Val Gate Alignment Loss')
+    ax.set(xlabel='Epoch', ylabel='Loss', title='Validation Loss Components Across Training')
+    ax.legend()
+    ax.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(run_dir, 'val_loss_components.png'), bbox_inches='tight', dpi=150)
+    plt.close(fig)
+
+
+def _save_val_gate_statistics(history: dict, run_dir: str):
+    """Separate plot: validation gate statistics across epochs."""
+    plt, _ = _import_plt()
+    if plt is None or not history.get('val_mean_eye_gate'):
+        return
+    epochs = np.arange(1, len(history['val_mean_eye_gate']) + 1)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(epochs, history['val_mean_eye_gate'], 'o-', lw=2, color='#2196F3', label='Val Mean Eye Gate')
+    ax.plot(epochs, history['val_mean_mouth_gate'], 's-', lw=2, color='#4CAF50', label='Val Mean Mouth Gate')
+    ax.axhline(y=1.0, color='gray', ls=':', lw=1, label='Max (clean target)')
+    ax.axhline(y=0.05, color='red', ls=':', lw=1, label='Floor (0.05)')
+    ax.set(xlabel='Epoch', ylabel='Mean Gate Value',
+           title='Validation Gate Statistics Across Training')
+    ax.legend()
+    ax.grid(True)
+    ax.set_ylim(0, 1.05)
+    plt.tight_layout()
+    plt.savefig(os.path.join(run_dir, 'val_gate_statistics.png'), bbox_inches='tight', dpi=150)
+    plt.close(fig)
+
+
+def _save_per_class_stress_tables(details_csv: str, run_dir: str):
+    """Generate per-class accuracy and gating benefit tables from stress details."""
+    if not os.path.exists(details_csv):
+        return
+    df = pd.read_csv(details_csv)
+    required = {'condition', 'regime', 'opacity', 'class_label',
+                'correct_gating_on', 'correct_gating_off'}
+    if not required.issubset(df.columns):
+        return
+
+    classes = sorted(df['class_label'].unique())
+    rows_on, rows_off, rows_delta = [], [], []
+
+    for (cond, regime, opacity), g in df.groupby(['condition', 'regime', 'opacity']):
+        on_row = {'condition': cond, 'regime': regime, 'opacity': opacity}
+        off_row = {'condition': cond, 'regime': regime, 'opacity': opacity}
+        delta_row = {'condition': cond, 'regime': regime, 'opacity': opacity}
+        for cls in classes:
+            sub = g[g['class_label'] == cls]
+            if len(sub) == 0:
+                on_row[f'{cls}_acc'] = None
+                off_row[f'{cls}_acc'] = None
+                delta_row[f'{cls}_delta'] = None
+            else:
+                on  = sub['correct_gating_on'].mean() * 100
+                off = sub['correct_gating_off'].mean() * 100
+                on_row[f'{cls}_acc'] = round(on, 2)
+                off_row[f'{cls}_acc'] = round(off, 2)
+                delta_row[f'{cls}_delta'] = round(on - off, 2)
+        rows_on.append(on_row)
+        rows_off.append(off_row)
+        rows_delta.append(delta_row)
+
+    cond_order = ['clean'] + [c for c in df['condition'].unique() if c != 'clean']
+    on_df = pd.DataFrame(rows_on)
+    off_df = pd.DataFrame(rows_off)
+    delta_df = pd.DataFrame(rows_delta)
+    if 'condition' in on_df.columns:
+        cat = pd.CategoricalDtype(categories=cond_order, ordered=True)
+        for tdf in (on_df, off_df, delta_df):
+            tdf['condition'] = tdf['condition'].astype(cat)
+        on_df = on_df.sort_values('condition').reset_index(drop=True)
+        off_df = off_df.sort_values('condition').reset_index(drop=True)
+        delta_df = delta_df.sort_values('condition').reset_index(drop=True)
+
+    on_df.to_csv(os.path.join(run_dir, 'per_class_accuracy.csv'), index=False)
+    off_df.to_csv(os.path.join(run_dir, 'per_class_accuracy_gating_off.csv'), index=False)
+    delta_df.to_csv(os.path.join(run_dir, 'per_class_gating_benefit.csv'), index=False)
+    print(f'  Saved per_class_accuracy.csv, per_class_accuracy_gating_off.csv, '
+          f'and per_class_gating_benefit.csv')
 
 
 def _save_confusion_matrix(preds, labels, label_names, run_dir: str):
@@ -581,6 +802,81 @@ def _save_per_class_stress_deltas(details_df: pd.DataFrame, run_dir: str):
     plt.close(fig)
 
 
+def _add_paired_stats_to_stress_summary(summary_df: pd.DataFrame,
+                                        details_df: pd.DataFrame,
+                                        seed: int) -> pd.DataFrame:
+    """Augment stress summary with paired delta CIs and exact p-values."""
+    if summary_df is None or len(summary_df) == 0 or details_df is None or len(details_df) == 0:
+        return summary_df
+
+    cond_col = 'condition' if 'condition' in details_df.columns else 'occlusion_type'
+    summary_cond_col = 'condition' if 'condition' in summary_df.columns else 'occlusion_type'
+    rows = []
+    for _, row in summary_df.iterrows():
+        cond = row[summary_cond_col]
+        sub = details_df[details_df[cond_col] == cond]
+        if len(sub) == 0:
+            rows.append(row.to_dict())
+            continue
+        stats = compute_paired_binary_statistics(
+            sub['correct_gating_on'].to_numpy(),
+            sub['correct_gating_off'].to_numpy(),
+            seed=seed,
+        )
+        merged = row.to_dict()
+        merged.update(stats)
+        merged['delta_significant_05'] = bool(
+            not np.isnan(stats['p_value_mcnemar']) and stats['p_value_mcnemar'] < 0.05)
+        rows.append(merged)
+    return pd.DataFrame(rows)
+
+
+def _extract_clean_metrics_from_stress_details(stress_details: pd.DataFrame) -> Dict:
+    """Build clean test metrics from the clean stress-test condition."""
+    if stress_details is None or len(stress_details) == 0 or 'condition' not in stress_details.columns:
+        return {}
+
+    clean_rows = stress_details[stress_details['condition'] == 'clean']
+    if len(clean_rows) == 0:
+        return {}
+
+    labels = clean_rows['gt_label'].to_numpy()
+    preds_on = clean_rows['pred_gating_on'].to_numpy()
+    preds_off = clean_rows['pred_gating_off'].to_numpy()
+
+    metrics = compute_classification_metrics(
+        labels, preds_on, label_names=['EyeClosed', 'Yawn', 'Neutral'])
+    uncertainty = compute_classification_uncertainty(labels, preds_on)
+    paired = compute_paired_binary_statistics(
+        clean_rows['correct_gating_on'].to_numpy(),
+        clean_rows['correct_gating_off'].to_numpy(),
+    )
+    off_metrics = compute_classification_metrics(
+        labels, preds_off, label_names=['EyeClosed', 'Yawn', 'Neutral'])
+
+    result = {
+        'accuracy': metrics.get('accuracy', 0.0),
+        'balanced_accuracy': metrics.get('balanced_accuracy', float('nan')),
+        'precision': metrics.get('precision', float('nan')),
+        'recall': metrics.get('recall', float('nan')),
+        'f1': metrics.get('f1', float('nan')),
+        'macro_precision': metrics.get('macro_precision', float('nan')),
+        'macro_recall': metrics.get('macro_recall', float('nan')),
+        'macro_f1': metrics.get('macro_f1', float('nan')),
+        'per_class': metrics.get('per_class', {}),
+        'confusion_matrix': metrics.get('confusion_matrix', []),
+        'uncertainty': uncertainty,
+        'gating_off_accuracy': off_metrics.get('accuracy', float('nan')),
+        'clean_delta_pp': paired.get('delta_pp', float('nan')),
+        'clean_delta_ci_low': paired.get('delta_ci_low', float('nan')),
+        'clean_delta_ci_high': paired.get('delta_ci_high', float('nan')),
+        'clean_delta_p_value': paired.get('p_value_mcnemar', float('nan')),
+        'n_samples': int(len(clean_rows)),
+        'source': 'stress_test_clean_condition',
+    }
+    return result
+
+
 def _save_comprehensive_analysis(model, val_loader, test_loader, val_samples,
                                  test_samples, history, stress_summary,
                                  stress_details, run_dir, device):
@@ -612,6 +908,8 @@ def _save_comprehensive_analysis(model, val_loader, test_loader, val_samples,
         print(f'  Saved {len(eval_df)} {eval_label} predictions and analysis plots')
 
     _save_training_dynamics(history, run_dir)
+    _save_val_loss_components(history, run_dir)
+    _save_val_gate_statistics(history, run_dir)
 
     if len(stress_summary) > 0:
         _save_stress_heatmap(stress_summary, run_dir, details_df=stress_details)
@@ -623,6 +921,14 @@ def _save_comprehensive_analysis(model, val_loader, test_loader, val_samples,
         'overall_accuracy': float(eval_df['is_correct'].mean() * 100) if len(eval_df) else 0,
     }
     if len(eval_df) > 0:
+        metrics = compute_classification_metrics(
+            eval_df['true'].to_numpy(),
+            eval_df['pred'].to_numpy(),
+            label_names=label_names,
+        )
+        summary['balanced_accuracy'] = metrics.get('balanced_accuracy', float('nan'))
+        summary['macro_f1'] = metrics.get('macro_f1', float('nan'))
+        summary['weighted_f1'] = metrics.get('f1', float('nan'))
         for cls in label_names:
             sub = eval_df[eval_df['class_name'] == cls]
             if len(sub) > 0:
@@ -641,14 +947,30 @@ def _load_extraction_models(device, args):
     from occlusion_estimator import ResNet34OcclusionModel
 
     print('Loading feature extraction models...')
-    feat_extractor = ResNet34FeatureExtractor(
-        CONFIG['RESNET34_MODEL_PATH'], device=str(device))
+    if device.type == 'cuda':
+        print(f'  [GPU] before feature extractor: {_gpu_memory_snapshot()}')
+    try:
+        feat_extractor = ResNet34FeatureExtractor(
+            CONFIG['RESNET34_MODEL_PATH'], device=str(device))
+    except Exception:
+        if device.type == 'cuda':
+            print(f'  [GPU] feature extractor load failed: {_gpu_memory_snapshot()}')
+        raise
     _gpu_cleanup('feature extractor loaded')
 
-    occ_model = ResNet34OcclusionModel(
-        CONFIG['RESNET34_OCCLUSION_MODEL_PATH'], device=str(device))
+    if device.type == 'cuda':
+        print(f'  [GPU] before occlusion model: {_gpu_memory_snapshot()}')
+    try:
+        occ_model = ResNet34OcclusionModel(
+            CONFIG['RESNET34_OCCLUSION_MODEL_PATH'], device=str(device))
+    except Exception:
+        if device.type == 'cuda':
+            print(f'  [GPU] occlusion model load failed: {_gpu_memory_snapshot()}')
+        raise
 
     det_size = (args.det_size, args.det_size) if args.face == 'retina' else None
+    if device.type == 'cuda':
+        print(f'  [GPU] before face detector: {_gpu_memory_snapshot()}')
     try:
         if args.face == 'retina':
             from face_detection_retinaface import FaceDetector
@@ -676,6 +998,10 @@ def _load_extraction_models(device, args):
 def main():
     ap = argparse.ArgumentParser(description='Train, evaluate, and stress-test DOFG pipeline')
     ap.add_argument('--data', default='Data', help='Path to Data folder')
+    ap.add_argument('--results-root', default='results',
+                    help='Directory under which the run folder will be created')
+    ap.add_argument('--run-name', default=None,
+                    help='Optional explicit run directory name')
     ap.add_argument('--samples', type=int, default=30,
                     help='Samples per video (0=all). Use 20-30 for quick CPU test')
     ap.add_argument('--epochs', type=int, default=5, help='Training epochs')
@@ -691,16 +1017,31 @@ def main():
                     help='clip=STRATEGY_DESIGN; legacy=frame sampling')
     ap.add_argument('--max-train-clips', type=int, default=None)
     ap.add_argument('--max-val-clips', type=int, default=None)
+    ap.add_argument('--max-test-clips', type=int, default=None)
     ap.add_argument('--seed', type=int, default=SEED)
     ap.add_argument('--stress', action='store_true', default=True)
     ap.add_argument('--no-stress', action='store_false', dest='stress')
     ap.add_argument('--stress-frames', type=int, default=20)
     ap.add_argument('--stress-opacities', type=str, default='0.4,0.6,0.8,1.0')
+    ap.add_argument('--train-opacity-mode',
+                    choices=['legacy', 'discrete', 'uniform'],
+                    default='legacy',
+                    help='Train-time opacity sampler: legacy=V4 hard/medium policy')
+    ap.add_argument('--train-opacity-values', type=str, default=None,
+                    help='Comma-separated train opacities for the discrete ablation, e.g. 0.4,0.6,0.8,1.0')
+    ap.add_argument('--train-opacity-weights', type=str, default=None,
+                    help='Optional comma-separated weights matching --train-opacity-values')
+    ap.add_argument('--train-opacity-range', type=str, default=None,
+                    help='Uniform train opacity range LOW,HIGH for the ablation, e.g. 0.4,1.0')
     ap.add_argument('--fold', type=int, default=0)
     ap.add_argument('--defer-test', action='store_true', default=True)
     ap.add_argument('--no-defer-test', action='store_false', dest='defer_test')
     ap.add_argument('--benchmark', action='store_true')
     ap.add_argument('--face-cpu', action='store_true')
+    ap.add_argument('--model', choices=['transformer', 'mlp_baseline', 'resnet_baseline'],
+                    default='transformer',
+                    help='Model architecture: transformer (gated), mlp_baseline (concat+MLP), '
+                         'or resnet_baseline (end-to-end ResNet-34 on face crop)')
     ap.add_argument('--class-weighted', action='store_true',
                     help='Use class-weighted cross-entropy loss')
     ap.add_argument('--gate-supervision', choices=['gt', 'estimator'], default='gt',
@@ -708,28 +1049,89 @@ def main():
     ap.add_argument('--gate-weight', type=float, default=0.5,
                     help='Weight for gate alignment loss (w_gate_occ)')
     ap.add_argument('--gate-floor', type=float, default=0.05,
-                    help='Minimum gate value (0.0-1.0)')
+                    help='Minimum gate value (0.0-1.0), used for all regions unless --asymmetric-floor')
+    ap.add_argument('--asymmetric-floor', action='store_true',
+                    help='Use different floor values for eye and mouth gates')
+    ap.add_argument('--eye-floor', type=float, default=None,
+                    help='Eye gate floor (only with --asymmetric-floor)')
+    ap.add_argument('--mouth-floor', type=float, default=None,
+                    help='Mouth gate floor (only with --asymmetric-floor)')
     ap.add_argument('--diversity-reg', type=float, default=0.0,
                     help='Gate diversity regularisation weight (0=off)')
+    ap.add_argument('--gating-mode', choices=['attention', 'legacy', 'both', 'none'],
+                    default='attention',
+                    help='Gating mechanism in the transformer. "attention" = additive '
+                         'log-gate bias on attention scores (V2, default, recommended); '
+                         '"legacy" = V4 multiplicative token gating (largely neutralised '
+                         'by pre-norm LayerNorm); "both" = apply both; "none" = gates '
+                         'computed for logging but not applied.')
+    # V7 Phase-1 defaults: only attention-bias is ON. Auxiliary heads opt-in.
+    ap.add_argument('--use-logit-bias', dest='use_logit_bias', action='store_true',
+                    help='Enable gate-conditioned per-class logit bias head '
+                         '(OFF by default — see docs/GATING_V7_MINIMAL.md).')
+    ap.add_argument('--no-logit-bias', dest='use_logit_bias', action='store_false',
+                    help='Disable the gate-conditioned per-class logit bias head.')
+    ap.add_argument('--use-estimator-calibration', dest='use_estimator_calibration',
+                    action='store_true',
+                    help='Enable joint eye+mouth estimator calibration head '
+                         '(OFF by default).')
+    ap.add_argument('--no-estimator-calibration', dest='use_estimator_calibration',
+                    action='store_false',
+                    help='Disable the joint eye+mouth estimator calibration head.')
+    ap.add_argument('--gate-dropout', type=float, default=0.0,
+                    help='Probability per sample/region of forcing gate=1.0 during '
+                         'training (default 0.0 = disabled).')
+    ap.add_argument('--clean-invariance-weight', type=float, default=0.0,
+                    help='Weight on MSE(logits_on, logits_off) for clean samples. '
+                         'Enforces gating≈no-op on clean frames. 0 = off (default).')
+    ap.add_argument('--clean-invariance-thresh', type=float, default=0.1,
+                    help='GT occlusion threshold for "clean" in the invariance reg.')
+    ap.add_argument('--checkpoint-metric', choices=['macro_f1', 'accuracy'],
+                    default='macro_f1',
+                    help='Validation metric used for best-checkpoint selection '
+                         '(default: macro_f1).')
+    ap.set_defaults(use_logit_bias=False, use_estimator_calibration=False)
     ap.add_argument('--clip-length', type=int, default=32,
                     help='Frames per clip (T)')
     ap.add_argument('--natural-occlusion-eval', action='store_true',
                     help='Run evaluation on natural-occlusion subset')
     args = ap.parse_args()
 
+    # Resolve per-region gate floors
+    if args.asymmetric_floor:
+        if args.eye_floor is None or args.mouth_floor is None:
+            ap.error('--asymmetric-floor requires both --eye-floor and --mouth-floor')
+        args._eye_floor = args.eye_floor
+        args._mouth_floor = args.mouth_floor
+        print(f'\n  Asymmetric gate floor ENABLED: eye={args._eye_floor}, mouth={args._mouth_floor}')
+    else:
+        args._eye_floor = args.gate_floor
+        args._mouth_floor = args.gate_floor
+
+    try:
+        args._train_opacity_sampler = _build_train_opacity_sampler(args)
+    except ValueError as e:
+        ap.error(str(e))
+
+    if args.model == 'resnet_baseline' and args.strategy != 'clip':
+        print('WARNING: resnet_baseline requires --strategy clip. Overriding.')
+        args.strategy = 'clip'
+
     if args.face_cpu:
         os.environ['DOFG_FACE_CPU'] = '1'
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    run_dir = _ensure_results_dir()
+    _require_cuda('run_train_eval.py')
+    _set_global_seed(args.seed)
+    device = torch.device('cuda')
+    run_dir = _ensure_results_dir(results_root=args.results_root, run_name=args.run_name)
     print(f'Results dir: {run_dir}')
     print(f'Device: {device}')
     if device.type == 'cuda':
-        torch.backends.cudnn.benchmark = False
         torch.cuda.empty_cache()
         print(f'GPU: {torch.cuda.get_device_name(0)} '
               f'({torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB)')
     print(f'Mode: {args.mode}, samples/video: {args.samples or "ALL"}, epochs: {args.epochs}')
+    print(f'Train opacity sampler: {args._train_opacity_sampler}')
 
     # Override CLIP_CONFIG['T'] if --clip-length differs from default
     if args.clip_length != 32:
@@ -744,13 +1146,36 @@ def main():
         'face_detector': args.face, 'det_size': args.det_size if args.face == 'retina' else None,
         'face_cpu': args.face_cpu, 'seed': args.seed,
         'stress_test': args.stress, 'stress_frames': args.stress_frames,
+        'train_opacity_sampler': args._train_opacity_sampler,
+        'train_opacity_mode': args._train_opacity_sampler.get('mode'),
+        'train_opacity_values': args._train_opacity_sampler.get('values'),
+        'train_opacity_weights': args._train_opacity_sampler.get('weights'),
+        'train_opacity_range': [
+            args._train_opacity_sampler.get('low'),
+            args._train_opacity_sampler.get('high'),
+        ] if args._train_opacity_sampler.get('mode') == 'uniform' else None,
         'defer_test': args.defer_test, 'strategy': args.strategy,
+        'model': args.model,
         'class_weighted': args.class_weighted,
         'gate_supervision': args.gate_supervision,
         'gate_weight': args.gate_weight,
         'gate_floor': args.gate_floor,
+        'asymmetric_floor': args.asymmetric_floor,
+        'eye_floor': args._eye_floor,
+        'mouth_floor': args._mouth_floor,
         'diversity_reg': args.diversity_reg,
+        'gating_mode': args.gating_mode,
+        'use_logit_bias': bool(args.use_logit_bias),
+        'use_estimator_calibration': bool(args.use_estimator_calibration),
+        'gate_dropout': float(args.gate_dropout),
+        'clean_invariance_weight': float(args.clean_invariance_weight),
+        'clean_invariance_thresh': float(args.clean_invariance_thresh),
+        'checkpoint_metric': args.checkpoint_metric,
+        'learning_rate': 1e-3 if args.model == 'resnet_baseline' else 3e-5,
         'clip_length': args.clip_length,
+        'max_train_clips': args.max_train_clips,
+        'max_val_clips': args.max_val_clips,
+        'max_test_clips': args.max_test_clips,
         'natural_occlusion_eval': args.natural_occlusion_eval,
         'validation_protocol': 'dual (clean primary + stress secondary)',
     }
@@ -774,6 +1199,18 @@ def main():
         csv_data, mode=args.mode, k=args.k,
         num_test=args.num_test, seed=args.seed, fold=args.fold)
     split_config = splits.get('split_config', {})
+    split_info = {
+        'mode': args.mode,
+        'fold': args.fold,
+        'k': args.k,
+        'seed': args.seed,
+        'train_subjects': split_config.get('train_subjects', []),
+        'test_subjects': split_config.get('test_subjects', []),
+        'train_videos': splits.get('train', []),
+        'test_videos': splits.get('test', []),
+    }
+    with open(os.path.join(run_dir, 'split_info.json'), 'w') as f:
+        json.dump(split_info, f, indent=2)
     print(f'Train videos: {len(splits["train"])}, Test videos: {len(splits["test"])}')
     print(f'Strategy: {args.strategy}')
     stage_times['stage1_data_loading'] = time.time() - t0
@@ -787,13 +1224,17 @@ def main():
     try:
         if args.strategy == 'clip':
             print('  Using clip-based pipeline (T=32, regime aug, temporal val)')
+            _save_crops = (args.model == 'resnet_baseline')
             train_samples, val_samples, test_samples, test_clips, val_clips = extract_features_for_clips(
                 csv_data, split_config,
                 face_detector=face_detector, feat_extractor=feat_extractor,
                 occ_model=occ_model, val_ratio=0.20, seed=args.seed,
                 max_train_clips=args.max_train_clips,
                 max_val_clips=args.max_val_clips,
-                skip_test=args.defer_test)
+                max_test_clips=args.max_test_clips,
+                skip_test=args.defer_test,
+                train_opacity_sampler=args._train_opacity_sampler,
+                save_face_crops=_save_crops)
         else:
             num_samples = args.samples if args.samples > 0 else None
             print(f'  Using legacy frame sampling (num_samples_per_video={num_samples or "ALL"})')
@@ -830,48 +1271,113 @@ def main():
     if test_samples:
         test_ds = DriverStateDataset(test_samples, device=str(device),
                                      gate_supervision=args.gate_supervision)
+        test_generator = torch.Generator()
+        test_generator.manual_seed(args.seed + 2)
         test_loader = DataLoader(test_ds, batch_size=args.batch, shuffle=False,
-                                 collate_fn=test_ds.collate_samples)
+                                 collate_fn=test_ds.collate_samples,
+                                 worker_init_fn=_seed_worker,
+                                 generator=test_generator)
 
+    train_generator = torch.Generator()
+    train_generator.manual_seed(args.seed)
     train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True,
-                              collate_fn=train_ds.collate_samples, drop_last=True)
+                              collate_fn=train_ds.collate_samples, drop_last=True,
+                              worker_init_fn=_seed_worker,
+                              generator=train_generator)
+    val_generator = torch.Generator()
+    val_generator.manual_seed(args.seed + 1)
     val_loader = DataLoader(val_ds, batch_size=args.batch, shuffle=False,
-                            collate_fn=val_ds.collate_samples)
+                            collate_fn=val_ds.collate_samples,
+                            worker_init_fn=_seed_worker,
+                            generator=val_generator)
 
-    model = EnhancedOcclusionAwareTransformer(
-        feature_dim=512, hidden_dim=128, num_heads=4,
-        num_classes=3, num_layers=3, use_relative_pos=True,
-        gate_floor=args.gate_floor,
-    ).to(device)
-    print(f'Model params: {sum(p.numel() for p in model.parameters()):,}')
+    if args.model == 'mlp_baseline':
+        model = RegionFeatureMLP(
+            feature_dim=512, hidden_dim=512, num_classes=3, dropout=0.3,
+        ).to(device)
+        effective_gate_weight = 0.0
+        print(f'Model: RegionFeatureMLP (no gating)')
+    elif args.model == 'resnet_baseline':
+        model = ResNet34Baseline(num_classes=3, dropout=0.3).to(device)
+        effective_gate_weight = 0.0
+        print(f'Model: ResNet34Baseline (end-to-end face-crop CNN)')
+    else:
+        model = EnhancedOcclusionAwareTransformer(
+            feature_dim=512, hidden_dim=128, num_heads=4,
+            num_classes=3, num_layers=3, use_relative_pos=True,
+            gate_floor=args.gate_floor,
+            eye_floor=args._eye_floor,
+            mouth_floor=args._mouth_floor,
+            gating_mode=args.gating_mode,
+            use_logit_bias=args.use_logit_bias,
+            use_estimator_calibration=args.use_estimator_calibration,
+            gate_dropout=args.gate_dropout,
+        ).to(device)
+        effective_gate_weight = args.gate_weight
+        print(f'Model: EnhancedOcclusionAwareTransformer '
+              f'(gating_mode={args.gating_mode}, logit_bias={args.use_logit_bias}, '
+              f'estimator_calibration={args.use_estimator_calibration}, '
+              f'gate_dropout={args.gate_dropout})')
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f'Model params: {total:,} total, {trainable:,} trainable')
 
     class_weights = None
     if args.class_weighted and train_samples:
         label_counts = Counter(s['label'] for s in train_samples)
         total = sum(label_counts.values())
-        n_classes = len(label_counts)
-        weights = [total / (n_classes * label_counts.get(i, 1)) for i in range(n_classes)]
+        num_classes = 3
+        present_classes = [i for i in range(num_classes) if label_counts.get(i, 0) > 0]
+        n_present = max(1, len(present_classes))
+        missing_classes = [i for i in range(num_classes) if i not in present_classes]
+        if missing_classes:
+            print(f'  WARNING: train subset is missing classes {missing_classes}; '
+                  'setting their class weights to 0.0 for this run.')
+        weights = [
+            (total / (n_present * label_counts[i])) if label_counts.get(i, 0) > 0 else 0.0
+            for i in range(num_classes)
+        ]
         class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
         print(f'  Class weights: {[f"{w:.2f}" for w in weights]}')
 
-    trainer = TinyTransformerTrainer(model, device=str(device), learning_rate=3e-5,
+    lr = 1e-3 if args.model == 'resnet_baseline' else 3e-5
+    trainer = TinyTransformerTrainer(model, device=str(device), learning_rate=lr,
                                     class_weights=class_weights,
-                                    gate_weight=args.gate_weight,
+                                    gate_weight=effective_gate_weight,
                                     gate_floor=args.gate_floor,
-                                    diversity_reg=args.diversity_reg)
+                                    eye_floor=args._eye_floor,
+                                    mouth_floor=args._mouth_floor,
+                                    diversity_reg=args.diversity_reg,
+                                    clean_invariance_weight=args.clean_invariance_weight,
+                                    clean_invariance_thresh=args.clean_invariance_thresh)
 
-    best_val_acc = 0.0
+    ckpt_metric = args.checkpoint_metric
+    best_ckpt_value = float('-inf')
+    best_val_acc = float('-inf')
+    best_val_f1  = 0.0
+    best_epoch = None
     for epoch in range(args.epochs):
+        # Per-epoch re-seed so stochastic components (dropout, gate_dropout,
+        # shuffling) are reproducible from the epoch number alone. This keeps
+        # the training loop byte-identical to run_gate_floor_sweep.py.
+        _set_global_seed(args.seed + epoch)
         train_metrics = trainer.train_epoch(train_loader, epoch=epoch)
-        val_metrics = trainer.evaluate(val_loader, name='VAL')
-        val_acc = val_metrics.get('accuracy', 0.0)
-        if val_acc > best_val_acc:
+        val_metrics = trainer.validate_epoch(val_loader, epoch=epoch)
+        val_acc = val_metrics.get('val_accuracy', 0.0)
+        val_f1  = val_metrics.get('val_macro_f1', 0.0)
+        metric_value = val_f1 if ckpt_metric == 'macro_f1' else val_acc
+
+        if best_epoch is None or metric_value > best_ckpt_value:
+            best_ckpt_value = metric_value
             best_val_acc = val_acc
+            best_val_f1  = val_f1
+            best_epoch = epoch + 1
             ckpt_path = os.path.join(run_dir, 'model_best.pt')
             torch.save(model.state_dict(), ckpt_path)
-            print(f'  ** Best val: {best_val_acc:.1f}% -> saved')
-        print(f'  Ep {epoch + 1}/{args.epochs}: train_acc={train_metrics.get("accuracy", 0):.1f}% '
-              f'val_acc={val_acc:.1f}%')
+            print(f'  ** Best val ({ckpt_metric}={metric_value:.3f}) -> saved')
+        print(f'  Ep {epoch + 1}/{args.epochs}: '
+              f'train_acc={train_metrics.get("accuracy", 0):.1f}% '
+              f'val_acc={val_acc:.1f}% val_f1={val_f1:.3f}')
 
     history = trainer.history
     with open(os.path.join(run_dir, 'training_history.json'), 'w') as f:
@@ -888,7 +1394,13 @@ def main():
     # Load best checkpoint
     ckpt = torch.load(os.path.join(run_dir, 'model_best.pt'),
                       map_location=device, weights_only=True)
-    model.load_state_dict(ckpt)
+    missing, unexpected = model.load_state_dict(ckpt, strict=False)
+    if missing:
+        print(f'  [ckpt] missing keys (new heads, randomly init): {missing[:4]}'
+              f'{" ..." if len(missing) > 4 else ""}')
+    if unexpected:
+        print(f'  [ckpt] unexpected keys (ignored): {unexpected[:4]}'
+              f'{" ..." if len(unexpected) > 4 else ""}')
     del ckpt
     _gpu_cleanup('best checkpoint loaded')
 
@@ -911,6 +1423,8 @@ def main():
             seed=args.seed,
             test_clips=val_clips,
             max_frames_per_clip=min(8, args.stress_frames // 2))
+        val_stress_summary = _add_paired_stats_to_stress_summary(
+            val_stress_summary, val_stress_details, seed=args.seed)
 
         if len(val_stress_details) > 0:
             val_stress_details.to_csv(os.path.join(run_dir, 'val_stress_details.csv'), index=False)
@@ -945,6 +1459,8 @@ def main():
             seed=args.seed,
             test_clips=test_clips if args.strategy == 'clip' else None,
             max_frames_per_clip=min(8, args.stress_frames // 2) if args.strategy == 'clip' else None)
+        stress_summary = _add_paired_stats_to_stress_summary(
+            stress_summary, stress_details, seed=args.seed)
 
         if len(stress_details) > 0:
             stress_details.to_csv(os.path.join(run_dir, 'stress_test_details.csv'), index=False)
@@ -955,6 +1471,8 @@ def main():
             _plot_opacity_analysis(stress_summary, run_dir)
             _plot_gates_vs_opacity(stress_details, run_dir)
             _save_per_class_stress_deltas(stress_details, run_dir)
+            _save_per_class_stress_tables(
+                os.path.join(run_dir, 'stress_test_details.csv'), run_dir)
         else:
             print('  No stress test results.')
 
@@ -973,30 +1491,32 @@ def main():
     if args.defer_test and not args.stress:
         eval_dict = {'accuracy': 0, 'n_samples': 0, 'source': 'defer_test_no_stress'}
     elif args.defer_test and len(stress_summary) > 0:
-        clean_row = stress_summary[stress_summary.get('condition', stress_summary.columns[0]) == 'clean'] \
-            if 'condition' in stress_summary.columns else pd.DataFrame()
-        if len(clean_row) > 0:
-            eval_dict = {
-                'accuracy': float(clean_row['acc_gating_on'].iloc[0]),
-                'n_samples': int(clean_row['n'].iloc[0]),
-                'source': 'stress_test_clean_condition',
-            }
-        else:
+        eval_dict = _extract_clean_metrics_from_stress_details(stress_details)
+        if not eval_dict:
             eval_dict = {'accuracy': 0, 'n_samples': 0, 'source': 'stress_test_clean_condition'}
     elif test_loader is not None:
         test_metrics = compute_metrics_on_loader(trainer, test_loader, compute_loss=True)
         eval_dict = {
             'accuracy': test_metrics.get('accuracy', 0),
+            'balanced_accuracy': test_metrics.get('balanced_accuracy'),
             'loss': test_metrics.get('loss'),
             'precision': test_metrics.get('precision'),
             'recall': test_metrics.get('recall'),
             'f1': test_metrics.get('f1'),
+            'macro_precision': test_metrics.get('macro_precision'),
+            'macro_recall': test_metrics.get('macro_recall'),
+            'macro_f1': test_metrics.get('macro_f1'),
+            'per_class': test_metrics.get('per_class', {}),
+            'confusion_matrix': test_metrics.get('confusion_matrix', []),
+            'uncertainty': test_metrics.get('uncertainty', {}),
             'n_samples': len(test_samples), 'source': 'test_loader',
         }
     else:
         eval_dict = {'accuracy': 0, 'n_samples': 0, 'source': 'none'}
 
-    eval_dict['val_clean_accuracy'] = best_val_acc
+    eval_dict['val_clean_accuracy'] = float(best_val_acc) if best_epoch is not None else 0.0
+    eval_dict['val_macro_f1']       = float(best_val_f1) if best_epoch is not None else 0.0
+    eval_dict['best_epoch'] = best_epoch
     if len(val_stress_summary) > 0:
         clean_vs = val_stress_summary[val_stress_summary['condition'] == 'clean'] \
             if 'condition' in val_stress_summary.columns else pd.DataFrame()
@@ -1006,11 +1526,19 @@ def main():
 
     with open(os.path.join(run_dir, 'eval_metrics.json'), 'w') as f:
         json.dump(eval_dict, f, indent=2)
+
+    # Compact, human-readable reports.
+    try:
+        from reporting import write_all_reports
+        write_all_reports(eval_dict, stress_summary, run_dir)
+    except Exception as e:
+        print(f'  [report] failed: {e}')
+
     print(f'  Test accuracy: {eval_dict["accuracy"]:.1f}%')
     print(f'  Val-Clean accuracy: {best_val_acc:.1f}%')
     if 'val_stress_mean_delta' in eval_dict:
         print(f'  Val-Stress mean delta: {eval_dict["val_stress_mean_delta"]:.2f} pp')
-    for k in ['loss', 'precision', 'recall', 'f1']:
+    for k in ['loss', 'precision', 'recall', 'f1', 'macro_f1', 'balanced_accuracy']:
         if eval_dict.get(k) is not None:
             print(f'  {k.capitalize()}: {eval_dict[k]:.4f}')
 
@@ -1054,11 +1582,15 @@ def main():
             print('  No natural occlusion samples found in test set.')
 
     # Occlusion visualization
-    if face_detector is not None:
-        occ_png = os.path.join(run_dir, 'occlusion_visualization.png')
-        if generate_occlusion_grid_png(csv_data, occ_png,
-                                       face_detector=face_detector, face_type=args.face):
-            print(f'Saved occlusion grid to {occ_png}')
+    occ_png = os.path.join(run_dir, 'occlusion_visualization.png')
+    if generate_occlusion_grid_png(csv_data, occ_png,
+                                   face_detector=face_detector, face_type=args.face):
+        print(f'Saved occlusion grid to {occ_png}')
+
+    opacity_png = os.path.join(run_dir, 'clean_vs_synthetic_opacity_grid.png')
+    if generate_clean_vs_synthetic_opacity_grid(
+            csv_data, opacity_png, face_detector=face_detector, face_type=args.face):
+        print(f'Saved clean-vs-synthetic opacity grid to {opacity_png}')
 
     # Latency benchmark
     if args.benchmark:

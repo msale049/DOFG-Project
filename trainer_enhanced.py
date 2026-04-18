@@ -5,20 +5,26 @@ TinyTransformerTrainer — trainer for EnhancedOcclusionAwareTransformer with
 a configurable loss:
 
     L = L_class  +  gate_weight * L_gate_align  +  diversity_reg * L_gate_div
+      +  clean_invariance_weight * L_clean_inv
 
 where
-  L_class      is cross-entropy over the 3 driver states.
-  L_gate_align teaches eye/mouth gate MLPs to output low values when
-               occlusion is high (gate target = floor + (1-floor) * (1 − p_occ)).
-  L_gate_div   is negative gate variance, encouraging diverse gate outputs
-               across the four regions (off by default, diversity_reg=0).
+  L_class       is cross-entropy over the 3 driver states.
+  L_gate_align  teaches eye/mouth gate MLPs to output low values when
+                occlusion is high (target = floor + (1-floor) * (1 − p_occ)).
+  L_gate_div    is negative gate variance, encouraging diverse gate outputs
+                across the four regions (off by default, diversity_reg=0).
+  L_clean_inv   is an MSE between logits with and without gating on samples
+                whose ground-truth occlusion is ≈ 0. Enforces the invariant
+                "gating is a no-op on clean data" directly at training time.
+                Off by default (clean_invariance_weight=0.0).
 
 Usage
 -----
     from trainer_enhanced import TinyTransformerTrainer
     trainer = TinyTransformerTrainer(model, device='cuda',
                                     gate_weight=0.5, gate_floor=0.05,
-                                    diversity_reg=0.0)
+                                    diversity_reg=0.0,
+                                    clean_invariance_weight=0.0)
     trainer.train_epoch(train_loader, epoch=0)
     trainer.evaluate(val_loader)
 """
@@ -32,6 +38,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from utils import move_batch_to_device
+
+try:
+    from sklearn.metrics import f1_score as _sk_f1_score
+    _HAS_SKLEARN = True
+except Exception:
+    _HAS_SKLEARN = False
 
 
 class TinyTransformerTrainer:
@@ -50,7 +62,11 @@ class TinyTransformerTrainer:
                  class_weights: torch.Tensor = None,
                  gate_weight: float = 0.5,
                  gate_floor: float = 0.05,
-                 diversity_reg: float = 0.0):
+                 eye_floor: float = None,
+                 mouth_floor: float = None,
+                 diversity_reg: float = 0.0,
+                 clean_invariance_weight: float = 0.0,
+                 clean_invariance_thresh: float = 0.1):
         self.model  = model.to(device)
         self.device = device
 
@@ -67,29 +83,44 @@ class TinyTransformerTrainer:
         self.loss_weights = {
             'classification': 1.0,
             'gate_occ':       gate_weight,
+            'clean_inv':      clean_invariance_weight,
         }
 
         self.gate_floor = gate_floor
+        self.eye_floor   = eye_floor if eye_floor is not None else gate_floor
+        self.mouth_floor = mouth_floor if mouth_floor is not None else gate_floor
         self.diversity_reg = diversity_reg
+        self.clean_invariance_weight = float(clean_invariance_weight)
+        self.clean_invariance_thresh = float(clean_invariance_thresh)
 
         self.history: Dict = {
             'epoch_losses':          [],
             'classification_losses': [],
             'gate_occ_losses':       [],
+            'clean_inv_losses':      [],
             'accuracies':            [],
             'learning_rates':        [],
             'mean_eye_gate':         [],
             'mean_mouth_gate':       [],
+            'val_epoch_losses':          [],
+            'val_classification_losses': [],
+            'val_gate_occ_losses':       [],
+            'val_accuracies':            [],
+            'val_macro_f1':              [],
+            'val_mean_eye_gate':         [],
+            'val_mean_mouth_gate':       [],
         }
 
-        print(f' TinyTransformerTrainer initialized on {device}')
+        print(f' TinyTransformerTrainer initialized on {device} '
+              f'(clean_inv_w={self.clean_invariance_weight})')
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _move_batch_to_device(self, batch: Dict) -> Dict:
         return move_batch_to_device(batch, self.device)
 
-    def _compute_losses(self, outputs: Dict, batch: Dict) -> Dict:
+    def _compute_losses(self, outputs: Dict, batch: Dict,
+                        clean_logits_off: torch.Tensor = None) -> Dict:
         labels = batch['label'].view(-1)
         if labels.dtype != torch.long:
             labels = labels.long()
@@ -99,15 +130,16 @@ class TinyTransformerTrainer:
 
         # Gate factors [B, 4]: [face, left_eye, right_eye, mouth]
         gf = outputs['gate_factors']
-        f = self.gate_floor
+        fe = self.eye_floor
+        fm = self.mouth_floor
 
-        # Gate alignment loss: target = f + (1-f) * (1 - p_occ)
+        # Gate alignment loss: target = floor + (1-floor) * (1 - p_occ)
         occ = batch.get('occlusion_targets', None)
         if isinstance(occ, torch.Tensor):
             eye_prob   = occ[:, 0].clamp(0, 1)
             mouth_prob = occ[:, 1].clamp(0, 1)
-            eye_target   = f + (1.0 - f) * (1.0 - eye_prob)
-            mouth_target = f + (1.0 - f) * (1.0 - mouth_prob)
+            eye_target   = fe + (1.0 - fe) * (1.0 - eye_prob)
+            mouth_target = fm + (1.0 - fm) * (1.0 - mouth_prob)
             gate_occ_reg = (F.mse_loss(gf[:, 1], eye_target) +
                             F.mse_loss(gf[:, 2], eye_target) +
                             F.mse_loss(gf[:, 3], mouth_target))
@@ -123,11 +155,29 @@ class TinyTransformerTrainer:
             gate_div_loss = -gate_var
             total_loss += self.diversity_reg * gate_div_loss
 
+        # Clean-invariance regulariser: MSE(logits_on, logits_off) on samples
+        # whose GT occlusion is ≈ 0 in both regions. Keeps the gated model
+        # from drifting away from the ungated model on clean frames — directly
+        # enforces the "gating is a no-op on clean data" invariant.
+        clean_inv_loss = torch.tensor(0.0, device=self.device)
+        if (self.clean_invariance_weight > 0.0
+                and clean_logits_off is not None
+                and isinstance(occ, torch.Tensor)):
+            thresh = self.clean_invariance_thresh
+            clean_mask = ((occ[:, 0] <= thresh) & (occ[:, 1] <= thresh))
+            if clean_mask.any():
+                logits_on  = outputs['class_logits'][clean_mask]
+                logits_off = clean_logits_off[clean_mask]
+                clean_inv_loss = F.mse_loss(logits_on, logits_off)
+                total_loss = total_loss + (
+                    self.loss_weights['clean_inv'] * clean_inv_loss)
+
         return {
             'total_loss':          total_loss,
             'classification_loss': class_loss,
             'gate_occ_reg':        gate_occ_reg,
             'gate_div_loss':       gate_div_loss,
+            'clean_inv_loss':      clean_inv_loss,
             'gate_factors':        gf.detach(),
         }
 
@@ -136,8 +186,11 @@ class TinyTransformerTrainer:
     def train_epoch(self, train_loader, epoch: int) -> Dict:
         self.model.train()
         epoch_losses, epoch_class_losses, epoch_gate_occ_losses = [], [], []
+        epoch_clean_inv_losses = []
         epoch_eye_gates, epoch_mouth_gates = [], []
         correct, total = 0, 0
+
+        use_clean_inv = self.clean_invariance_weight > 0.0
 
         print(f'\n EPOCH {epoch + 1} TRAINING')
         for batch_idx, batch in enumerate(train_loader):
@@ -146,7 +199,23 @@ class TinyTransformerTrainer:
                 self.optimizer.zero_grad(set_to_none=True)
 
                 outputs = self.model(batch['features'], batch['occlusion_info'])
-                losses  = self._compute_losses(outputs, batch)
+
+                clean_logits_off = None
+                if use_clean_inv:
+                    # Second forward with gating forced off. Used only by the
+                    # clean-invariance regulariser; the "off" logits are a
+                    # detached target so gradients flow through the gated path
+                    # back to the gating mechanism (not through the target).
+                    with torch.no_grad():
+                        out_off = self.model(
+                            batch['features'], batch['occlusion_info'],
+                            disable_gating=True,
+                        )
+                        clean_logits_off = out_off['class_logits'].detach()
+                        del out_off
+
+                losses  = self._compute_losses(outputs, batch,
+                                               clean_logits_off=clean_logits_off)
                 total_loss = losses['total_loss']
 
                 if torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -160,6 +229,7 @@ class TinyTransformerTrainer:
                 epoch_losses.append(total_loss.item())
                 epoch_class_losses.append(losses['classification_loss'].item())
                 epoch_gate_occ_losses.append(losses['gate_occ_reg'].item())
+                epoch_clean_inv_losses.append(float(losses['clean_inv_loss'].item()))
 
                 gf = losses['gate_factors']
                 epoch_eye_gates.append(gf[:, 1:3].mean().item())
@@ -188,6 +258,7 @@ class TinyTransformerTrainer:
             avg_loss     = float(np.mean(epoch_losses))
             avg_class    = float(np.mean(epoch_class_losses))
             avg_gate_occ = float(np.mean(epoch_gate_occ_losses))
+            avg_clean_inv = float(np.mean(epoch_clean_inv_losses)) if epoch_clean_inv_losses else 0.0
             avg_eye_g    = float(np.mean(epoch_eye_gates))
             avg_mouth_g  = float(np.mean(epoch_mouth_gates))
             accuracy     = correct / max(total, 1) * 100.0
@@ -196,22 +267,109 @@ class TinyTransformerTrainer:
             self.history['epoch_losses'].append(avg_loss)
             self.history['classification_losses'].append(avg_class)
             self.history['gate_occ_losses'].append(avg_gate_occ)
+            self.history['clean_inv_losses'].append(avg_clean_inv)
             self.history['accuracies'].append(accuracy)
             self.history['learning_rates'].append(lr)
             self.history['mean_eye_gate'].append(avg_eye_g)
             self.history['mean_mouth_gate'].append(avg_mouth_g)
 
+            ci_str = f' CleanInv={avg_clean_inv:.4f}' if use_clean_inv else ''
             print(f'\n Epoch {epoch + 1}: Loss={avg_loss:.4f} '
-                  f'Class={avg_class:.4f} GateOcc={avg_gate_occ:.4f} '
+                  f'Class={avg_class:.4f} GateOcc={avg_gate_occ:.4f}'
+                  f'{ci_str} '
                   f'Acc={accuracy:.1f}% '
                   f'EyeGate={avg_eye_g:.3f} MouthGate={avg_mouth_g:.3f} '
                   f'LR={lr:.2e}')
             return {'avg_loss': avg_loss, 'accuracy': accuracy,
                     'class_loss': avg_class, 'gate_occ_loss': avg_gate_occ,
+                    'clean_inv_loss': avg_clean_inv,
                     'mean_eye_gate': avg_eye_g, 'mean_mouth_gate': avg_mouth_g}
 
         return {'avg_loss': float('inf'), 'accuracy': 0.0,
                 'class_loss': float('inf')}
+
+    # ── Validation (per-epoch tracking) ──────────────────────────────────────
+
+    def validate_epoch(self, val_loader, epoch: int) -> Dict:
+        """Run validation pass recording losses, accuracy, macro-F1 and gate stats."""
+        self.model.eval()
+        v_losses, v_cls, v_gate = [], [], []
+        v_eye_g, v_mouth_g = [], []
+        all_preds, all_labels = [], []
+        correct, total = 0, 0
+
+        with torch.no_grad():
+            for batch in val_loader:
+                batch   = self._move_batch_to_device(batch)
+                outputs = self.model(batch['features'], batch['occlusion_info'])
+                losses  = self._compute_losses(outputs, batch)
+                tl = losses['total_loss']
+                if torch.isnan(tl) or torch.isinf(tl):
+                    continue
+                v_losses.append(tl.item())
+                v_cls.append(losses['classification_loss'].item())
+                v_gate.append(losses['gate_occ_reg'].item())
+                gf = losses['gate_factors']
+                v_eye_g.append(gf[:, 1:3].mean().item())
+                v_mouth_g.append(gf[:, 3].mean().item())
+
+                pred   = outputs['predicted_class'].view(-1)
+                labels = batch['label'].view(-1)
+                correct += (pred == labels).sum().item()
+                total   += labels.size(0)
+                all_preds.extend(pred.detach().cpu().numpy().tolist())
+                all_labels.extend(labels.detach().cpu().numpy().tolist())
+
+        if not v_losses:
+            return {'val_accuracy': 0.0, 'val_macro_f1': 0.0}
+
+        macro_f1 = 0.0
+        if all_preds and all_labels:
+            if _HAS_SKLEARN:
+                try:
+                    macro_f1 = float(_sk_f1_score(
+                        all_labels, all_preds, average='macro', zero_division=0))
+                except Exception:
+                    macro_f1 = 0.0
+            else:
+                # Minimal fallback: compute per-class F1 by hand.
+                preds = np.asarray(all_preds)
+                labels = np.asarray(all_labels)
+                classes = np.unique(np.concatenate([preds, labels]))
+                f1s = []
+                for c in classes:
+                    tp = int(((preds == c) & (labels == c)).sum())
+                    fp = int(((preds == c) & (labels != c)).sum())
+                    fn = int(((preds != c) & (labels == c)).sum())
+                    denom = 2 * tp + fp + fn
+                    f1s.append((2 * tp / denom) if denom > 0 else 0.0)
+                macro_f1 = float(np.mean(f1s)) if f1s else 0.0
+
+        result = {
+            'val_loss':          float(np.mean(v_losses)),
+            'val_class_loss':    float(np.mean(v_cls)),
+            'val_gate_occ_loss': float(np.mean(v_gate)),
+            'val_accuracy':      correct / max(total, 1) * 100.0,
+            'val_macro_f1':      macro_f1,
+            'val_eye_gate':      float(np.mean(v_eye_g)),
+            'val_mouth_gate':    float(np.mean(v_mouth_g)),
+        }
+        self.history['val_epoch_losses'].append(result['val_loss'])
+        self.history['val_classification_losses'].append(result['val_class_loss'])
+        self.history['val_gate_occ_losses'].append(result['val_gate_occ_loss'])
+        self.history['val_accuracies'].append(result['val_accuracy'])
+        self.history['val_macro_f1'].append(result['val_macro_f1'])
+        self.history['val_mean_eye_gate'].append(result['val_eye_gate'])
+        self.history['val_mean_mouth_gate'].append(result['val_mouth_gate'])
+
+        print(f'\n Epoch {epoch + 1} VAL: Loss={result["val_loss"]:.4f} '
+              f'Class={result["val_class_loss"]:.4f} '
+              f'GateOcc={result["val_gate_occ_loss"]:.4f} '
+              f'Acc={result["val_accuracy"]:.1f}% '
+              f'MacroF1={result["val_macro_f1"]:.3f} '
+              f'EyeGate={result["val_eye_gate"]:.3f} '
+              f'MouthGate={result["val_mouth_gate"]:.3f}')
+        return result
 
     # ── Evaluation ────────────────────────────────────────────────────────────
 
@@ -253,15 +411,15 @@ class TinyTransformerTrainer:
     def train(self, train_loader, val_loader, num_epochs: int = 20,
               patience: int = 20, save_path: str = 'best_transformer.pth') -> Dict:
         """Train for up to *num_epochs* with early stopping on val accuracy."""
-        best_val_acc = 0.0
+        best_val_acc = float('-inf')
         epochs_no_improve = 0
 
         for epoch in range(num_epochs):
             self.train_epoch(train_loader, epoch)
-            val_result = self.evaluate(val_loader, name='VAL')
-            val_acc = val_result['accuracy']
+            val_metrics = self.validate_epoch(val_loader, epoch)
+            val_acc = val_metrics.get('val_accuracy', 0.0)
 
-            if val_acc > best_val_acc:
+            if epoch == 0 or val_acc > best_val_acc:
                 best_val_acc = val_acc
                 epochs_no_improve = 0
                 torch.save(self.model.state_dict(), save_path)

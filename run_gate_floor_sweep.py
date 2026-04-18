@@ -73,6 +73,7 @@ from stress_test import (
     run_with_gating_disabled,
 )
 from ablation_utils import disable_gates_at_inference
+from reporting import write_all_reports
 
 # ─── GPU helpers ─────────────────────────────────────────────────────────────
 
@@ -517,6 +518,8 @@ def _train_and_eval_one_floor(
         'use_logit_bias': bool(args.use_logit_bias),
         'use_estimator_calibration': bool(args.use_estimator_calibration),
         'gate_dropout': float(args.gate_dropout),
+        'clean_invariance_weight': float(args.clean_invariance_weight),
+        'checkpoint_metric': args.checkpoint_metric,
         'validation_protocol': 'clean primary',
     }
     with open(os.path.join(run_dir, 'config.json'), 'w') as f:
@@ -577,23 +580,42 @@ def _train_and_eval_one_floor(
         model, device=str(device), learning_rate=3e-5,
         class_weights=class_weights, gate_weight=args.gate_weight,
         gate_floor=gate_floor, eye_floor=gate_floor, mouth_floor=gate_floor,
-        diversity_reg=0.0)
+        diversity_reg=0.0,
+        clean_invariance_weight=args.clean_invariance_weight,
+        clean_invariance_thresh=args.clean_invariance_thresh)
 
     # ── Training ─────────────────────────────────────────────────────────────
     t0 = time.time()
+    # Checkpoint-selection metric. 'macro_f1' is preferred — val_accuracy is
+    # dominated by the Neutral majority class and can select an epoch where
+    # the gating/logit-bias head has learned a class-prior shortcut.
+    ckpt_metric = args.checkpoint_metric
+    best_ckpt_value = float('-inf')
     best_val_acc = float('-inf')
+    best_val_f1  = 0.0
     best_epoch = None
     for epoch in range(args.epochs):
         _set_global_seed(args.seed + epoch)
         train_metrics = trainer.train_epoch(train_loader, epoch=epoch)
         val_metrics = trainer.validate_epoch(val_loader, epoch=epoch)
         val_acc = val_metrics.get('val_accuracy', 0.0)
-        if best_epoch is None or val_acc > best_val_acc:
+        val_f1  = val_metrics.get('val_macro_f1', 0.0)
+
+        if ckpt_metric == 'macro_f1':
+            metric_value = val_f1
+        else:
+            metric_value = val_acc
+
+        if best_epoch is None or metric_value > best_ckpt_value:
+            best_ckpt_value = metric_value
             best_val_acc = val_acc
+            best_val_f1  = val_f1
             best_epoch = epoch + 1
             torch.save(model.state_dict(), ckpt_path)
         print(f'  Ep {epoch+1}/{args.epochs}: train_acc={train_metrics.get("accuracy",0):.1f}% '
-              f'val_acc={val_acc:.1f}%')
+              f'val_acc={val_acc:.1f}% val_f1={val_f1:.3f}  '
+              f'[ckpt={ckpt_metric}={metric_value:.3f} '
+              f'best={best_ckpt_value:.3f}@ep{best_epoch}]')
 
     with open(os.path.join(run_dir, 'training_history.json'), 'w') as f:
         json.dump({k: (v if isinstance(v, list) else str(v))
@@ -636,6 +658,7 @@ def _train_and_eval_one_floor(
     else:
         eval_dict = {'accuracy': 0, 'n_samples': 0, 'source': 'none'}
     eval_dict['val_clean_accuracy'] = float(best_val_acc) if best_epoch is not None else 0.0
+    eval_dict['val_macro_f1']       = float(best_val_f1) if best_epoch is not None else 0.0
     eval_dict['best_epoch'] = best_epoch
     stage_times['clean_eval'] = time.time() - t0
 
@@ -667,10 +690,15 @@ def _train_and_eval_one_floor(
                 'source': 'stress_test_clean_condition',
             })
     eval_dict['val_clean_accuracy'] = float(best_val_acc) if best_epoch is not None else 0.0
+    eval_dict['val_macro_f1']       = float(best_val_f1) if best_epoch is not None else 0.0
     eval_dict['best_epoch'] = best_epoch
 
     with open(os.path.join(run_dir, 'eval_metrics.json'), 'w') as f:
         json.dump(eval_dict, f, indent=2)
+
+    # Compact, human-readable reports (stress_summary_compact.csv,
+    # overall_deltas.csv, run_report.txt).
+    write_all_reports(eval_dict, stress_summary, run_dir)
 
     _save_fold_level_analysis(
         model=model,
@@ -736,16 +764,36 @@ def main():
     ap.add_argument('--gating-mode', choices=['attention', 'legacy', 'both', 'none'],
                     default='attention',
                     help='Gating mechanism in the transformer (default: attention = '
-                         'new log-gate attention bias; survives LayerNorm).')
-    ap.add_argument('--no-logit-bias', action='store_false', dest='use_logit_bias',
+                         'log-gate attention bias; survives LayerNorm).')
+    # V7 Phase-1 defaults: only attention-bias is ON. Auxiliary heads opt-in.
+    ap.add_argument('--use-logit-bias', dest='use_logit_bias', action='store_true',
+                    help='Enable gate-conditioned per-class logit bias head '
+                         '(OFF by default — see docs/GATING_V7_MINIMAL.md).')
+    ap.add_argument('--no-logit-bias', dest='use_logit_bias', action='store_false',
                     help='Disable the gate-conditioned per-class logit bias head.')
-    ap.add_argument('--no-estimator-calibration', action='store_false',
-                    dest='use_estimator_calibration',
+    ap.add_argument('--use-estimator-calibration', dest='use_estimator_calibration',
+                    action='store_true',
+                    help='Enable joint eye+mouth estimator calibration head '
+                         '(OFF by default).')
+    ap.add_argument('--no-estimator-calibration', dest='use_estimator_calibration',
+                    action='store_false',
                     help='Disable the joint eye+mouth estimator calibration head.')
-    ap.add_argument('--gate-dropout', type=float, default=0.1,
+    ap.add_argument('--gate-dropout', type=float, default=0.0,
                     help='Probability per sample/region of forcing gate=1.0 during '
-                         'training (default 0.1). Set to 0 to disable.')
-    ap.set_defaults(use_logit_bias=True, use_estimator_calibration=True)
+                         'training (default 0.0 = disabled).')
+    ap.add_argument('--clean-invariance-weight', type=float, default=0.0,
+                    help='Weight on MSE(logits_on, logits_off) for samples whose '
+                         'ground-truth occlusion is below the threshold. Enforces '
+                         'gating≈no-op on clean frames. 0 = disabled (default).')
+    ap.add_argument('--clean-invariance-thresh', type=float, default=0.1,
+                    help='GT occlusion threshold (per region) below which a sample '
+                         'counts as clean for the invariance regulariser.')
+    ap.add_argument('--checkpoint-metric', choices=['macro_f1', 'accuracy'],
+                    default='macro_f1',
+                    help='Validation metric used for best-checkpoint selection. '
+                         'macro_f1 (default) avoids picking a Yawn-over-prediction '
+                         'epoch under class-weighted training.')
+    ap.set_defaults(use_logit_bias=False, use_estimator_calibration=False)
     args = ap.parse_args()
 
     gate_floors = sorted(set(float(x.strip()) for x in args.floors.split(',')))
@@ -817,6 +865,9 @@ def main():
         'use_logit_bias': bool(args.use_logit_bias),
         'use_estimator_calibration': bool(args.use_estimator_calibration),
         'gate_dropout': float(args.gate_dropout),
+        'clean_invariance_weight': float(args.clean_invariance_weight),
+        'clean_invariance_thresh': float(args.clean_invariance_thresh),
+        'checkpoint_metric': args.checkpoint_metric,
     }
     with open(os.path.join(sweep_dir, 'sweep_config.json'), 'w') as f:
         json.dump(sweep_manifest, f, indent=2)

@@ -31,6 +31,7 @@ from synthetic_occlusion import (
 from ablation_utils import disable_gates_at_inference
 from data_loading import sample_frames_for_audit
 from synthetic_occlusion import apply_eye_band, apply_mouth_rect
+from resnet_baseline import crop_and_preprocess_face, face_crop_to_tensor
 
 STRESS_REGIMES = [
     'persistent_eye',
@@ -119,10 +120,14 @@ def run_stress_test_detailed(
     total_frames = sum(len(v) for v in sampled.values())
     print(f'  Stress-test: {total_frames} frames from {len(sampled)} videos')
 
+    _model_needs_crop = getattr(model, 'needs_face_crop', False)
     use_cuda = (device == 'cuda')
     if use_cuda:
         print('  Warming up GPU...')
-        _w_feat = {r: torch.randn(1, 512, device=device) for r in ['face', 'left_eye', 'right_eye', 'mouth']}
+        if _model_needs_crop:
+            _w_feat = {'face_crop': torch.randn(1, 3, 224, 224, device=device)}
+        else:
+            _w_feat = {r: torch.randn(1, 512, device=device) for r in ['face', 'left_eye', 'right_eye', 'mouth']}
         _w_occ = {'eye_occlusion_prob': torch.tensor([0.0], device=device),
                   'mouth_occlusion_prob': torch.tensor([0.0], device=device)}
         for _ in range(10):
@@ -196,12 +201,18 @@ def run_stress_test_detailed(
                     if any(feat[k] is None for k in rkeys):
                         continue
 
-                    fdict = {
-                        'face': torch.tensor(feat['face_features'], dtype=torch.float32).unsqueeze(0).to(device),
-                        'left_eye': torch.tensor(feat['left_eye_features'], dtype=torch.float32).unsqueeze(0).to(device),
-                        'right_eye': torch.tensor(feat['right_eye_features'], dtype=torch.float32).unsqueeze(0).to(device),
-                        'mouth': torch.tensor(feat['mouth_features'], dtype=torch.float32).unsqueeze(0).to(device),
-                    }
+                    if _model_needs_crop:
+                        fc = crop_and_preprocess_face(aug_bgr, fb)
+                        if fc is None:
+                            continue
+                        fdict = {'face_crop': face_crop_to_tensor(fc).unsqueeze(0).to(device)}
+                    else:
+                        fdict = {
+                            'face': torch.tensor(feat['face_features'], dtype=torch.float32).unsqueeze(0).to(device),
+                            'left_eye': torch.tensor(feat['left_eye_features'], dtype=torch.float32).unsqueeze(0).to(device),
+                            'right_eye': torch.tensor(feat['right_eye_features'], dtype=torch.float32).unsqueeze(0).to(device),
+                            'mouth': torch.tensor(feat['mouth_features'], dtype=torch.float32).unsqueeze(0).to(device),
+                        }
 
                     _t = time.perf_counter()
                     probs = occ_model.predict_probs(
@@ -334,6 +345,7 @@ def run_stress_test_clips(
     t0 = time.time()
     use_cuda = (device == 'cuda')
     n_conditions = len(conditions)
+    _model_needs_crop = getattr(model, 'needs_face_crop', False)
 
     for clip in test_clips:
         meta = csv_data.get(clip.video_key)
@@ -390,12 +402,18 @@ def run_stress_test_clips(
                 if any(feat[k] is None for k in rkeys):
                     continue
 
-                fdict = {
-                    'face': torch.tensor(feat['face_features'], dtype=torch.float32).unsqueeze(0).to(device),
-                    'left_eye': torch.tensor(feat['left_eye_features'], dtype=torch.float32).unsqueeze(0).to(device),
-                    'right_eye': torch.tensor(feat['right_eye_features'], dtype=torch.float32).unsqueeze(0).to(device),
-                    'mouth': torch.tensor(feat['mouth_features'], dtype=torch.float32).unsqueeze(0).to(device),
-                }
+                if _model_needs_crop:
+                    fc = crop_and_preprocess_face(aug_bgr, fb)
+                    if fc is None:
+                        continue
+                    fdict = {'face_crop': face_crop_to_tensor(fc).unsqueeze(0).to(device)}
+                else:
+                    fdict = {
+                        'face': torch.tensor(feat['face_features'], dtype=torch.float32).unsqueeze(0).to(device),
+                        'left_eye': torch.tensor(feat['left_eye_features'], dtype=torch.float32).unsqueeze(0).to(device),
+                        'right_eye': torch.tensor(feat['right_eye_features'], dtype=torch.float32).unsqueeze(0).to(device),
+                        'mouth': torch.tensor(feat['mouth_features'], dtype=torch.float32).unsqueeze(0).to(device),
+                    }
                 probs = occ_model.predict_probs(
                     aug_rgb, face_bbox=fb, image_bgr=False, face_margin=0.15)
                 occ_info = {
@@ -534,6 +552,8 @@ def run_latency_benchmark(
     use_cuda = (device == 'cuda')
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
+    _model_needs_crop = getattr(model, 'needs_face_crop', False)
+
     # Warm-up
     for _ in range(num_warmup):
         det = face_detector.detect_face_and_landmarks(bgr)
@@ -542,12 +562,18 @@ def run_latency_benchmark(
                 bgr, det['face_bbox'], det['eye_regions'], det['mouth_region'])
             probs = occ_model.predict_probs(
                 rgb, face_bbox=det['face_bbox'], image_bgr=False, face_margin=0.15)
-            fdict = {
-                'face': torch.tensor(feat['face_features'], dtype=torch.float32).unsqueeze(0).to(device),
-                'left_eye': torch.tensor(feat['left_eye_features'], dtype=torch.float32).unsqueeze(0).to(device),
-                'right_eye': torch.tensor(feat['right_eye_features'], dtype=torch.float32).unsqueeze(0).to(device),
-                'mouth': torch.tensor(feat['mouth_features'], dtype=torch.float32).unsqueeze(0).to(device),
-            }
+            if _model_needs_crop:
+                fc = crop_and_preprocess_face(bgr, det['face_bbox'])
+                fdict = {'face_crop': face_crop_to_tensor(fc).unsqueeze(0).to(device)} if fc is not None else None
+            else:
+                fdict = {
+                    'face': torch.tensor(feat['face_features'], dtype=torch.float32).unsqueeze(0).to(device),
+                    'left_eye': torch.tensor(feat['left_eye_features'], dtype=torch.float32).unsqueeze(0).to(device),
+                    'right_eye': torch.tensor(feat['right_eye_features'], dtype=torch.float32).unsqueeze(0).to(device),
+                    'mouth': torch.tensor(feat['mouth_features'], dtype=torch.float32).unsqueeze(0).to(device),
+                }
+            if fdict is None:
+                continue
             occ_info = {
                 'eye_occlusion_prob': torch.tensor([float(probs[0])], device=device, dtype=torch.float32),
                 'mouth_occlusion_prob': torch.tensor([float(probs[1])], device=device, dtype=torch.float32),
@@ -584,12 +610,18 @@ def run_latency_benchmark(
             torch.cuda.synchronize()
         t_occ.append((time.perf_counter() - t0) * 1000)
 
-        fdict = {
-            'face': torch.tensor(feat['face_features'], dtype=torch.float32).unsqueeze(0).to(device),
-            'left_eye': torch.tensor(feat['left_eye_features'], dtype=torch.float32).unsqueeze(0).to(device),
-            'right_eye': torch.tensor(feat['right_eye_features'], dtype=torch.float32).unsqueeze(0).to(device),
-            'mouth': torch.tensor(feat['mouth_features'], dtype=torch.float32).unsqueeze(0).to(device),
-        }
+        if _model_needs_crop:
+            fc = crop_and_preprocess_face(bgr, det['face_bbox'])
+            if fc is None:
+                continue
+            fdict = {'face_crop': face_crop_to_tensor(fc).unsqueeze(0).to(device)}
+        else:
+            fdict = {
+                'face': torch.tensor(feat['face_features'], dtype=torch.float32).unsqueeze(0).to(device),
+                'left_eye': torch.tensor(feat['left_eye_features'], dtype=torch.float32).unsqueeze(0).to(device),
+                'right_eye': torch.tensor(feat['right_eye_features'], dtype=torch.float32).unsqueeze(0).to(device),
+                'mouth': torch.tensor(feat['mouth_features'], dtype=torch.float32).unsqueeze(0).to(device),
+            }
         occ_info = {
             'eye_occlusion_prob': torch.tensor([float(probs[0])], device=device, dtype=torch.float32),
             'mouth_occlusion_prob': torch.tensor([float(probs[1])], device=device, dtype=torch.float32),

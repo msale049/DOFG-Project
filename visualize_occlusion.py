@@ -33,6 +33,179 @@ from synthetic_occlusion import (
 from occlusion_augmentation import apply_occlusion_to_frame, get_transient_segment
 
 
+def _load_face_detector(face_type: str = 'dlib'):
+    """Load the requested face detector with dlib fallback."""
+    try:
+        if face_type == 'retina':
+            from face_detection_retinaface import FaceDetector
+            return FaceDetector(
+                shape_model_path=CONFIG['DLIB_MODEL_PATH'],
+                det_size=(640, 640),
+                det_thresh=0.35,
+            )
+        from face_detection_dlib import FaceDetector
+        return FaceDetector(shape_model_path=CONFIG['DLIB_MODEL_PATH'])
+    except ImportError:
+        from face_detection_dlib import FaceDetector
+        return FaceDetector(shape_model_path=CONFIG['DLIB_MODEL_PATH'])
+
+
+def _collect_valid_face_samples(
+    csv_data: dict,
+    face_detector,
+    num_samples: int = 4,
+    frames_to_try_per_video: int = 24,
+):
+    """Collect a small set of clean frames with valid landmarks."""
+    samples = []
+
+    for video_key, meta in csv_data.items():
+        anns = meta.get('annotations', [])
+        if not anns:
+            continue
+
+        cap = cv2.VideoCapture(meta['video_path'])
+        if not cap.isOpened():
+            continue
+
+        try_indices = np.linspace(
+            0, len(anns) - 1, min(frames_to_try_per_video, len(anns)), dtype=int)
+
+        found_for_video = False
+        for idx in try_indices:
+            ann = anns[int(idx)]
+            cap.set(cv2.CAP_PROP_POS_FRAMES, ann.frame)
+            ret, bgr = cap.read()
+            if not ret:
+                continue
+
+            det = face_detector.detect_face_and_landmarks(bgr)
+            if not det['is_valid'] or det.get('landmarks') is None:
+                continue
+
+            samples.append({
+                'rgb': cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB),
+                'landmarks': det['landmarks'],
+                'subject': meta.get('subject', 'unknown'),
+                'video_key': video_key,
+                'frame': ann.frame,
+                'class_label': ann.class_label,
+            })
+            found_for_video = True
+            break
+
+        cap.release()
+
+        if found_for_video and len(samples) >= num_samples:
+            break
+
+    return samples
+
+
+def generate_clean_vs_synthetic_opacity_grid(
+    csv_data: dict,
+    output_path: str,
+    face_detector=None,
+    face_type: str = 'dlib',
+    opacities=None,
+    n_clean_samples: int = 4,
+) -> bool:
+    """
+    Generate a figure with:
+    - a strip of clean frames from the dataset
+    - an opacity sweep for eye, mouth, and combined synthetic occlusions
+
+    Returns True if saved successfully.
+    """
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib import gridspec
+    except ImportError:
+        return False
+
+    if not csv_data:
+        return False
+
+    if opacities is None:
+        opacities = OPACITY_LEVELS
+    opacities = list(opacities)
+
+    if face_detector is None:
+        face_detector = _load_face_detector(face_type)
+
+    clean_samples = _collect_valid_face_samples(
+        csv_data, face_detector, num_samples=max(1, n_clean_samples))
+    if not clean_samples:
+        return False
+
+    base = clean_samples[0]
+    base_rgb = base['rgb']
+    base_lm = base['landmarks']
+
+    fig = plt.figure(figsize=(2.9 * len(opacities), 9.5))
+    outer = gridspec.GridSpec(2, 1, height_ratios=[1.05, 3.1], hspace=0.22)
+
+    clean_grid = gridspec.GridSpecFromSubplotSpec(
+        1, len(clean_samples), subplot_spec=outer[0], wspace=0.05)
+    for idx, sample in enumerate(clean_samples):
+        ax = fig.add_subplot(clean_grid[0, idx])
+        ax.imshow(sample['rgb'])
+        ax.set_title(
+            f'Clean {idx + 1}\n{sample["class_label"]} | {sample["subject"]}',
+            fontsize=9,
+        )
+        ax.axis('off')
+
+    sweep_grid = gridspec.GridSpecFromSubplotSpec(
+        3, len(opacities), subplot_spec=outer[1], wspace=0.04, hspace=0.08)
+    row_specs = [
+        ('Eye occlusion', lambda img, lm, op: apply_eye_band(img, lm, opacity=op)),
+        ('Mouth occlusion', lambda img, lm, op: apply_mouth_rect(img, lm, opacity=op)),
+        ('Both', lambda img, lm, op: apply_synthetic_occlusion(
+            img, lm, eye_opacity=op, mouth_opacity=op)),
+    ]
+
+    for row_idx, (row_label, apply_fn) in enumerate(row_specs):
+        for col_idx, opacity in enumerate(opacities):
+            ax = fig.add_subplot(sweep_grid[row_idx, col_idx])
+            if opacity <= 0:
+                aug = base_rgb.copy()
+            else:
+                aug = apply_fn(base_rgb.copy(), base_lm, float(opacity))
+            ax.imshow(aug)
+            if row_idx == 0:
+                col_title = 'Clean' if opacity <= 0 else f'Opacity {opacity:.1f}'
+                ax.set_title(col_title, fontsize=10)
+            if col_idx == 0:
+                ax.text(
+                    -0.08, 0.5, row_label,
+                    transform=ax.transAxes,
+                    ha='right',
+                    va='center',
+                    fontsize=10,
+                    fontweight='bold',
+                )
+            ax.axis('off')
+
+    fig.suptitle(
+        'Clean vs Synthetic Occlusion Examples',
+        fontsize=14,
+        fontweight='bold',
+        y=0.98,
+    )
+    fig.text(
+        0.5, 0.015,
+        'Bottom sweep uses one representative clean frame rendered with the same '
+        'eye-band and mouth-rectangle synthetic occlusion utilities used in training/stress code.',
+        ha='center',
+        va='bottom',
+        fontsize=9,
+    )
+    plt.savefig(output_path, bbox_inches='tight', dpi=160)
+    plt.close(fig)
+    return True
+
+
 def generate_occlusion_grid_png(
     csv_data: dict,
     output_path: str,
@@ -54,19 +227,7 @@ def generate_occlusion_grid_png(
 
     # Load face detector if not provided
     if face_detector is None:
-        try:
-            if face_type == 'retina':
-                from face_detection_retinaface import FaceDetector
-                face_detector = FaceDetector(
-                    shape_model_path=CONFIG['DLIB_MODEL_PATH'],
-                    det_size=(640, 640), det_thresh=0.35,
-                )
-            else:
-                from face_detection_dlib import FaceDetector
-                face_detector = FaceDetector(shape_model_path=CONFIG['DLIB_MODEL_PATH'])
-        except ImportError:
-            from face_detection_dlib import FaceDetector
-            face_detector = FaceDetector(shape_model_path=CONFIG['DLIB_MODEL_PATH'])
+        face_detector = _load_face_detector(face_type)
 
     video_key = list(csv_data.keys())[0]
     meta = csv_data[video_key]
@@ -163,18 +324,7 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
 
-    # Load face detector
-    try:
-        if args.face == 'retina':
-            from face_detection_retinaface import FaceDetector
-            detector = FaceDetector(shape_model_path=CONFIG['DLIB_MODEL_PATH'], det_size=(640, 640), det_thresh=0.35)
-        else:
-            from face_detection_dlib import FaceDetector
-            detector = FaceDetector(shape_model_path=CONFIG['DLIB_MODEL_PATH'])
-    except ImportError as e:
-        print(f'Face detector failed: {e}. Falling back to dlib.')
-        from face_detection_dlib import FaceDetector
-        detector = FaceDetector(shape_model_path=CONFIG['DLIB_MODEL_PATH'])
+    detector = _load_face_detector(args.face)
 
     csv_data = load_csv_video_data(args.data, filter_eye_states=True)
     if not csv_data:
@@ -295,6 +445,11 @@ def main():
         plt.close()
     except ImportError:
         pass
+
+    opacity_grid_path = os.path.join(args.out, 'clean_vs_synthetic_opacity_grid.png')
+    if generate_clean_vs_synthetic_opacity_grid(
+        csv_data, opacity_grid_path, face_detector=detector, face_type=args.face):
+        print(f'Saved clean vs synthetic opacity grid to {opacity_grid_path}')
 
     print(f'Saved occlusion samples to {args.out}/')
 
